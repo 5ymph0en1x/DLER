@@ -5,8 +5,8 @@
 VSVersionInfo(
     ffi=FixedFileInfo(
         # Version numbers (Major, Minor, Patch, Build)
-        filevers=(1, 0, 0, 0),
-        prodvers=(1, 0, 0, 0),
+        filevers=(1, 0, 1, 0),
+        prodvers=(1, 0, 1, 0),
         # Bitmask: 0x3F = all flags valid
         mask=0x3f,
         # Flags: 0 = release build
@@ -28,12 +28,12 @@ VSVersionInfo(
                     [
                         StringStruct('CompanyName', 'Symphoenix'),
                         StringStruct('FileDescription', 'DLER - Ultra-Fast Usenet Downloader'),
-                        StringStruct('FileVersion', '1.0.0.0'),
+                        StringStruct('FileVersion', '1.0.1.0'),
                         StringStruct('InternalName', 'DLER'),
                         StringStruct('LegalCopyright', '2026 Symphoenix. All rights reserved.'),
                         StringStruct('OriginalFilename', 'DLER.exe'),
                         StringStruct('ProductName', 'DLER'),
-                        StringStruct('ProductVersion', '1.0.0'),
+                        StringStruct('ProductVersion', '1.0.1'),
                         StringStruct('Comments', 'High-performance NZB downloader with AVX2 acceleration'),
                     ]
                 )
