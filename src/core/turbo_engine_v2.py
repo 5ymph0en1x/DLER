@@ -354,6 +354,8 @@ class TurboEngineV2:
         self._rename_lock = threading.Lock()
         # Track file paths: Dict[file_index] -> current_path
         self._file_paths: Dict[int, Path] = {}
+        # Track used filenames to avoid collisions: Set[safe_name]
+        self._used_filenames: set = set()
 
         # Flush mmap every N writes (reduced I/O for throughput)
         # 500 segments ~= 400 MB between flushes
@@ -443,6 +445,11 @@ class TurboEngineV2:
         # Reset speed tracker
         self._speed_tracker = SpeedTracker(window_seconds=3.0, alpha=0.25)
 
+        # Reset filename tracking for this download
+        self._used_filenames.clear()
+        self._renamed_files.clear()
+        self._file_paths.clear()
+
         print(f"\nDownloading {len(files)} files, {self._stats.segments_total} segments")
 
         # Show backend info
@@ -464,11 +471,21 @@ class TurboEngineV2:
         try:
             # Prepare output files with memory mapping
             # Also initialize progress tracking for progressive finalization
+            logger.info(f"[PREPARE] Preparing {len(files)} files...")
             for nzb_file in files:
+                logger.debug(f"[PREPARE] File {nzb_file.index}: '{nzb_file.filename}' ({nzb_file.size} bytes, {len(nzb_file.segments)} segments)")
                 self._prepare_file(nzb_file)
+                # Verify file handle was created
+                if nzb_file.index not in self._file_handles:
+                    logger.error(f"[PREPARE] FAILED to create handle for file {nzb_file.index}: '{nzb_file.filename}'")
+                else:
+                    logger.debug(f"[PREPARE] OK - handle created for file {nzb_file.index}")
                 # Initialize progress tracking: [written, total]
                 self._file_progress[nzb_file.index] = [0, len(nzb_file.segments)]
                 self._file_info[nzb_file.index] = nzb_file
+
+            # Log summary of prepared files
+            logger.info(f"[PREPARE] Completed: {len(self._file_handles)} handles created for {len(files)} files")
 
             # Build work queue and segment map
             work_queue: Queue[NZBSegment] = Queue()
@@ -808,50 +825,74 @@ class TurboEngineV2:
                         if file_idx not in self._renamed_files:
                             self._renamed_files[file_idx] = item.yenc_filename
 
-                if file_idx in self._file_handles:
-                    handle = self._file_handles[file_idx]
-                    pos = item.position
-                    data = item.data
-                    data_len = len(data)
-                    file_size = handle[2]
+                if file_idx not in self._file_handles:
+                    logger.warning(f"[WRITER] No file handle for file_idx={file_idx}, segment dropped!")
+                    local_errors += 1
+                    continue
 
-                    if pos + data_len <= file_size:
-                        if self.write_through:
-                            # WriteThrough mode: direct file write (DyMaxIO compatible)
-                            f = handle[0]
-                            with self._file_locks[file_idx]:
-                                f.seek(pos)
-                                f.write(data)
+                handle = self._file_handles[file_idx]
+                pos = item.position
+                data = item.data
+                data_len = len(data)
+                file_size = handle[2]
+
+                # Skip writes for zero-size files (dummy handles)
+                if file_size == 0:
+                    logger.debug(f"[WRITER] Skipping write for zero-size file {file_idx}")
+                    local_segs += 1  # Count as success for progress
+                    # Still track progress for finalization
+                    with self._progress_lock:
+                        if file_idx in self._file_progress:
+                            progress = self._file_progress[file_idx]
+                            progress[0] += 1
+                            if progress[0] >= progress[1]:
+                                nzb_file = self._file_info.get(file_idx)
+                                if nzb_file:
+                                    self._finalize_file(nzb_file)
+                                    del self._file_progress[file_idx]
+                                    del self._file_info[file_idx]
+                    continue
+
+                if pos + data_len <= file_size:
+                    if self.write_through:
+                        # WriteThrough mode: direct file write (DyMaxIO compatible)
+                        f = handle[0]
+                        with self._file_locks[file_idx]:
+                            f.seek(pos)
+                            f.write(data)
+                        local_bytes += data_len
+                        local_segs += 1
+                    else:
+                        # mmap mode: fast memory-mapped write
+                        mm = handle[1]
+                        if mm:
+                            mm[pos:pos + data_len] = data
                             local_bytes += data_len
                             local_segs += 1
-                        else:
-                            # mmap mode: fast memory-mapped write
-                            mm = handle[1]
-                            if mm:
-                                mm[pos:pos + data_len] = data
-                                local_bytes += data_len
-                                local_segs += 1
 
-                                # Periodic flush
-                                write_count = handle[3] + 1
-                                handle[3] = write_count
-                                if write_count % self._flush_interval == 0:
-                                    with self._file_locks[file_idx]:
-                                        mm.flush()
+                            # Periodic flush
+                            write_count = handle[3] + 1
+                            handle[3] = write_count
+                            if write_count % self._flush_interval == 0:
+                                with self._file_locks[file_idx]:
+                                    mm.flush()
 
-                        # === PROGRESSIVE FILE FINALIZATION ===
-                        # Track progress and auto-finalize when file is complete
-                        with self._progress_lock:
-                            if file_idx in self._file_progress:
-                                progress = self._file_progress[file_idx]
-                                progress[0] += 1  # Increment written count
-                                if progress[0] >= progress[1]:
-                                    # File complete! Finalize to release RAM
-                                    nzb_file = self._file_info.get(file_idx)
-                                    if nzb_file:
-                                        self._finalize_file(nzb_file)
-                                        del self._file_progress[file_idx]
-                                        del self._file_info[file_idx]
+                    # === PROGRESSIVE FILE FINALIZATION ===
+                    # Track progress and auto-finalize when file is complete
+                    with self._progress_lock:
+                        if file_idx in self._file_progress:
+                            progress = self._file_progress[file_idx]
+                            progress[0] += 1  # Increment written count
+                            if progress[0] >= progress[1]:
+                                # File complete! Finalize to release RAM
+                                nzb_file = self._file_info.get(file_idx)
+                                if nzb_file:
+                                    self._finalize_file(nzb_file)
+                                    del self._file_progress[file_idx]
+                                    del self._file_info[file_idx]
+                else:
+                    logger.warning(f"[WRITER] Position out of bounds: pos={pos}, data_len={data_len}, file_size={file_size}")
+                    local_errors += 1
 
                 # Clear reference to release memory immediately
                 del item
@@ -859,6 +900,7 @@ class TurboEngineV2:
 
             except Exception as e:
                 local_errors += 1
+                logger.warning(f"[WRITER] Error writing segment: {e}")
 
             self._write_queue.task_done()
             update_counter += 1
@@ -997,19 +1039,83 @@ class TurboEngineV2:
     def _prepare_file(self, nzb_file: NZBFile) -> None:
         """Prepare output file for writing."""
         try:
-            safe_name = "".join(c if c.isalnum() or c in '.-_' else '_'
-                               for c in nzb_file.filename)
-            filepath = self.output_dir / safe_name
+            # Handle empty filename
+            if not nzb_file.filename or not nzb_file.filename.strip():
+                safe_name = f"file_{nzb_file.index:04d}"
+                logger.warning(f"[PREPARE] Empty filename for file {nzb_file.index}, using: {safe_name}")
+            else:
+                safe_name = "".join(c if c.isalnum() or c in '.-_' else '_'
+                                   for c in nzb_file.filename)
 
-            # Delete existing file if present
+            # Ensure safe_name is not empty after sanitization
+            if not safe_name or not safe_name.strip():
+                safe_name = f"file_{nzb_file.index:04d}"
+                logger.warning(f"[PREPARE] Sanitized filename empty for file {nzb_file.index}, using: {safe_name}")
+
+            # === HANDLE DUPLICATE FILENAMES ===
+            # If this filename was already used, add index suffix
+            original_safe_name = safe_name
+            if safe_name in self._used_filenames:
+                # Find unique name by adding index suffix
+                base_name = safe_name
+                ext = ""
+                # Try to preserve extension
+                if '.' in safe_name:
+                    last_dot = safe_name.rfind('.')
+                    base_name = safe_name[:last_dot]
+                    ext = safe_name[last_dot:]
+
+                counter = 1
+                while safe_name in self._used_filenames:
+                    safe_name = f"{base_name}_{nzb_file.index:03d}{ext}"
+                    counter += 1
+                    if counter > 1000:  # Safety limit
+                        safe_name = f"file_{nzb_file.index:04d}{ext}"
+                        break
+
+                logger.info(f"[PREPARE] Duplicate filename '{original_safe_name}' -> using '{safe_name}' for file {nzb_file.index}")
+
+            # Mark this filename as used
+            self._used_filenames.add(safe_name)
+
+            filepath = self.output_dir / safe_name
+            logger.debug(f"[PREPARE] Creating file: {filepath}")
+
+            # Delete existing file if present (from previous run, not current session)
             if filepath.exists():
-                filepath.unlink()
+                try:
+                    filepath.unlink()
+                    logger.debug(f"[PREPARE] Deleted existing file: {filepath}")
+                except Exception as del_e:
+                    # File locked - add unique suffix
+                    base_name = safe_name
+                    ext = ""
+                    if '.' in safe_name:
+                        last_dot = safe_name.rfind('.')
+                        base_name = safe_name[:last_dot]
+                        ext = safe_name[last_dot:]
+                    safe_name = f"{base_name}_{nzb_file.index:03d}_new{ext}"
+                    filepath = self.output_dir / safe_name
+                    self._used_filenames.add(safe_name)
+                    logger.warning(f"[PREPARE] Could not delete existing file, using: {safe_name}")
+
+            # Handle zero-size files
+            if nzb_file.size <= 0:
+                logger.warning(f"[PREPARE] File {nzb_file.index} has size {nzb_file.size}, creating empty placeholder")
+                # Create empty file but still add to handles so writer doesn't error
+                with open(filepath, 'wb') as f:
+                    pass
+                self._file_paths[nzb_file.index] = filepath
+                # Create dummy handle entry so writer can find it (no-op writes)
+                self._file_handles[nzb_file.index] = [None, None, 0, 0]
+                self._file_locks[nzb_file.index] = threading.Lock()
+                return
 
             # Create sparse file with correct size
             with open(filepath, 'wb') as f:
-                if nzb_file.size > 0:
-                    f.seek(nzb_file.size - 1)
-                    f.write(b'\x00')
+                f.seek(nzb_file.size - 1)
+                f.write(b'\x00')
+            logger.debug(f"[PREPARE] Created sparse file: {filepath} ({nzb_file.size} bytes)")
 
             # Track file path for potential renaming (obfuscated files)
             self._file_paths[nzb_file.index] = filepath
@@ -1020,25 +1126,24 @@ class TurboEngineV2:
                 f = open(filepath, 'r+b', buffering=0)  # Unbuffered
                 # Store: [file_handle, None (no mmap), size, write_count]
                 self._file_handles[nzb_file.index] = [f, None, nzb_file.size, 0]
+                logger.debug(f"[PREPARE] WriteThrough handle created for file {nzb_file.index}")
             else:
                 # mmap mode: fast but uses more RAM
                 flags = os.O_RDWR | getattr(os, 'O_BINARY', 0)
                 fd = os.open(str(filepath), flags)
 
-                if nzb_file.size > 0:
-                    mm = mmap.mmap(fd, nzb_file.size, access=mmap.ACCESS_WRITE)
-                else:
-                    mm = None
+                mm = mmap.mmap(fd, nzb_file.size, access=mmap.ACCESS_WRITE)
 
                 # Store: [fd, mmap, size, write_count]
                 self._file_handles[nzb_file.index] = [fd, mm, nzb_file.size, 0]
+                logger.debug(f"[PREPARE] mmap handle created for file {nzb_file.index}")
 
             self._file_locks[nzb_file.index] = threading.Lock()
 
         except Exception as e:
-            print(f"Failed to prepare file {nzb_file.filename}: {e}")
+            logger.error(f"[PREPARE] EXCEPTION for file {nzb_file.index} '{nzb_file.filename}': {e}")
             import traceback
-            traceback.print_exc()
+            logger.error(f"[PREPARE] Traceback: {traceback.format_exc()}")
 
     def _finalize_file(self, nzb_file: NZBFile) -> None:
         """Close file handles, flush, and rename if obfuscated."""
