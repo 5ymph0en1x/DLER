@@ -1,0 +1,18 @@
+# DLER - High-Performance NZB Downloader
+# Core dependencies
+
+aiofiles>=23.2.1
+rich>=13.7.0
+textual>=0.47.0
+lxml>=5.1.0
+msgpack>=1.0.7
+orjson>=3.9.0
+numpy>=1.26.0
+diskcache>=5.6.0
+
+# TKinter Modern Themes (Marantz-style GUI)
+TKinterModernThemes>=1.10.0
+
+# Development dependencies
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
