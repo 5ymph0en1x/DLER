@@ -6,7 +6,7 @@
 
 High-performance NZB downloader with AVX2 acceleration, designed for maximum speed and reliability.
 
-![DLER Screenshot](screenshots/gui.jpg)
+![DLER Screenshot](screenshots/gui2.jpg)
 
 ## Features
 
