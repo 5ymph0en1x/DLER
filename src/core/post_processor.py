@@ -50,6 +50,8 @@ def _extract_filename_from_subject(subject: str) -> Optional[str]:
     Subject formats vary but commonly include:
     - "release name" filename.ext yEnc (1/10)
     - [group] release - "filename.ext" yEnc
+    - release.name.part01.rar yEnc (1/100)
+    - [#a]release.name.part01.rar yEnc
     """
     if not subject:
         return None
@@ -60,16 +62,43 @@ def _extract_filename_from_subject(subject: str) -> Optional[str]:
         return quoted.group(1)
 
     # Try to find filename before yEnc marker
-    yenc_match = re.search(r'([^\s"]+\.[a-zA-Z0-9]{2,7})\s*yEnc', subject, re.IGNORECASE)
+    yenc_match = re.search(r'([^\s"\[\]]+\.[a-zA-Z0-9]{2,7})\s*yEnc', subject, re.IGNORECASE)
     if yenc_match:
         return yenc_match.group(1)
 
-    # Try to find any filename pattern
-    file_match = re.search(r'([^\s"<>|]+\.(rar|r\d{2,3}|zip|7z|par2|nfo|sfv|nzb|mkv|avi|mp4|iso))', subject, re.IGNORECASE)
+    # Try to find part/vol pattern (common in RAR sets)
+    part_match = re.search(r'([^\s"\[\]]+\.(?:part\d+|vol\d+[+\d]*)\.[a-zA-Z0-9]{2,7})', subject, re.IGNORECASE)
+    if part_match:
+        return part_match.group(1)
+
+    # Try to find any filename pattern with common extensions
+    file_match = re.search(r'([^\s"\[\]<>|]+\.(?:rar|r\d{2,3}|zip|7z|par2|nfo|sfv|nzb|mkv|avi|mp4|iso|m2ts|ts))', subject, re.IGNORECASE)
     if file_match:
         return file_match.group(1)
 
     return None
+
+
+def _normalize_filename(filename: str) -> str:
+    """
+    Normalize filename for comparison.
+
+    Handles common Usenet filename variations:
+    - Spaces ↔ underscores
+    - Parentheses () → underscores
+    - Multiple underscores → single underscore
+    """
+    normalized = filename.lower()
+    # Replace spaces and parentheses with underscores
+    normalized = normalized.replace(' ', '_')
+    normalized = normalized.replace('(', '_')
+    normalized = normalized.replace(')', '_')
+    # Collapse multiple underscores
+    while '__' in normalized:
+        normalized = normalized.replace('__', '_')
+    # Remove leading/trailing underscores
+    normalized = normalized.strip('_')
+    return normalized
 
 
 class PostProcessStatus(Enum):
@@ -1058,22 +1087,37 @@ class PostProcessor:
 
             # Extract filenames from NZB <file> elements
             # Try with namespace first
-            for file_elem in root.findall('.//nzb:file', ns):
+            file_elements_ns = root.findall('.//nzb:file', ns)
+            logger.debug(f"Found {len(file_elements_ns)} <file> elements with namespace")
+
+            for file_elem in file_elements_ns:
                 subject = file_elem.get('subject', '')
                 # Extract filename from subject (usually in quotes or after yEnc)
                 filename = _extract_filename_from_subject(subject)
                 if filename:
                     metadata.filenames.append(filename)
+                elif subject:
+                    logger.debug(f"Could not extract filename from subject: {subject[:80]}...")
 
             # Try without namespace
             if not metadata.filenames:
-                for file_elem in root.findall('.//file'):
+                file_elements_no_ns = root.findall('.//file')
+                logger.debug(f"Found {len(file_elements_no_ns)} <file> elements without namespace")
+
+                for file_elem in file_elements_no_ns:
                     subject = file_elem.get('subject', '')
                     filename = _extract_filename_from_subject(subject)
                     if filename:
                         metadata.filenames.append(filename)
+                    elif subject:
+                        logger.debug(f"Could not extract filename from subject: {subject[:80]}...")
 
             logger.info(f"NZB Metadata: title={metadata.title}, password={'***' if metadata.password else 'None'}, files={len(metadata.filenames)}")
+
+            # Debug: show first few filenames extracted
+            if metadata.filenames:
+                sample = metadata.filenames[:5]
+                logger.info(f"NZB filenames sample: {sample}")
 
         except Exception as e:
             logger.error(f"Failed to parse NZB metadata: {e}")
@@ -1203,15 +1247,19 @@ class PostProcessor:
         self,
         archive: Path,
         password: Optional[str] = None,
-        output_dir: Optional[Path] = None
+        output_dir: Optional[Path] = None,
+        base_progress: float = 30,
+        progress_range: float = 60
     ) -> Tuple[bool, int, str]:
         """
-        Extract archive using 7-Zip.
+        Extract archive using 7-Zip with real-time progress tracking.
 
         Args:
             archive: Path to archive file
             password: Archive password (optional)
             output_dir: Output directory (default: self.extract_dir)
+            base_progress: Starting progress percentage for reporting
+            progress_range: Progress range to use (e.g., 30-90 = range of 60)
 
         Returns:
             Tuple of (success, files_extracted, message)
@@ -1220,19 +1268,22 @@ class PostProcessor:
             return False, 0, "7-Zip not available"
 
         self._current_status = PostProcessStatus.EXTRACTING
-        self._report_progress(f"Extracting: {archive.name}", 0)
+        self._report_progress(f"Extracting: {archive.name}", base_progress)
 
         out_dir = output_dir or self.extract_dir
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        # Count existing files BEFORE extraction to compute delta
+        existing_files = set(f for f in out_dir.rglob('*') if f.is_file())
+
         try:
-            # Build 7z command
+            # Build 7z command with progress output
             cmd = [
                 self.sevenzip_path,
                 'x',  # Extract with full paths
                 '-y',  # Yes to all prompts
-                '-bb0',  # Less output
-                '-bd',  # No progress indicator
+                '-bsp1',  # Show progress on stdout
+                '-bb1',  # Show file names
                 f'-o{out_dir}',  # Output directory
             ]
 
@@ -1250,29 +1301,63 @@ class PostProcessor:
 
             logger.info(f"Running 7z: {cmd[0]} x -y ... {archive.name}")
             start_time = time.time()
+            last_progress_time = start_time
+            last_percent = 0
 
-            result = subprocess.run(
+            # Use Popen for real-time progress
+            process = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
                 cwd=str(archive.parent),
-                timeout=7200,  # 2 hours max
-                creationflags=SUBPROCESS_FLAGS  # Hide console window
+                creationflags=SUBPROCESS_FLAGS,
+                bufsize=1  # Line buffered
             )
 
+            # Read output in real-time
+            output_lines = []
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
+
+                if line:
+                    output_lines.append(line)
+
+                    # Parse progress percentage from 7z output
+                    # Format: " 45% - filename" or just "45%"
+                    match = re.search(r'(\d+)%', line)
+                    if match:
+                        pct = int(match.group(1))
+                        now = time.time()
+
+                        # Update progress at most every 0.3s to avoid flooding
+                        if pct != last_percent and (now - last_progress_time) > 0.3:
+                            # Map 0-100% from 7z to base_progress to base_progress+progress_range
+                            mapped_pct = base_progress + (progress_range * pct / 100)
+                            self._report_progress(f"Extracting: {pct}%", mapped_pct)
+                            last_percent = pct
+                            last_progress_time = now
+
+            process.wait()
             elapsed = time.time() - start_time
 
-            if result.returncode == 0:
-                # Count extracted files
-                files_count = sum(1 for _ in out_dir.rglob('*') if _.is_file())
+            if process.returncode == 0:
+                # Count NEW extracted files only
+                current_files = set(f for f in out_dir.rglob('*') if f.is_file())
+                new_files = current_files - existing_files
+                files_count = len(new_files)
+
                 logger.info(f"Extraction OK: {files_count} files ({elapsed:.1f}s)")
+                self._report_progress(f"Extracted: {files_count} files", base_progress + progress_range)
                 return True, files_count, f"Extracted {files_count} files ({elapsed:.1f}s)"
             else:
-                error_msg = result.stderr or result.stdout or "Unknown error"
+                error_msg = ''.join(output_lines[-10:]) if output_lines else "Unknown error"
                 # Check for password error
                 if 'Wrong password' in error_msg or 'password' in error_msg.lower():
                     return False, 0, "Wrong password"
-                logger.error(f"7z failed: {error_msg}")
+                logger.error(f"7z failed: {error_msg[:200]}")
                 return False, 0, f"Failed: {error_msg[:200]}"
 
         except subprocess.TimeoutExpired:
@@ -1297,26 +1382,71 @@ class PostProcessor:
         search_dir = directory or self.download_dir
         removed = 0
 
-        # Convert to lowercase set for case-insensitive matching
-        allowed_lower = {f.lower() for f in allowed_filenames} if allowed_filenames else None
+        # Convert to normalized set for case-insensitive matching
+        # Use _normalize_filename to handle spaces, underscores, parentheses
+        allowed_normalized = set()
+        if allowed_filenames:
+            for f in allowed_filenames:
+                allowed_normalized.add(_normalize_filename(f))
+
+        # Extract common prefix from allowed filenames for fallback matching
+        # e.g., "farmers_life_v1.0.43" from "Farmers_Life_v1.0.43.part001.rar"
+        allowed_prefixes = set()
+        if allowed_filenames:
+            for fname in allowed_filenames:
+                # Extract base name before .part, .vol, or extension
+                base = re.sub(r'\.(part\d+|vol\d+[+\d]*|r\d+|par2|rar|zip|7z|sfv|nfo|flac|mp3|jpg|png).*$', '', fname.lower())
+                if base and len(base) > 5:  # Minimum prefix length
+                    # Normalize for consistent matching
+                    base_normalized = _normalize_filename(base)
+                    allowed_prefixes.add(base_normalized)
+
+            # Debug logging
+            if allowed_prefixes:
+                logger.info(f"Cleanup prefixes ({len(allowed_prefixes)}): {list(allowed_prefixes)[:3]}")
+            else:
+                logger.warning(f"No valid prefixes extracted from {len(allowed_filenames)} NZB filenames")
+                # Show sample of what was in allowed_filenames
+                sample = list(allowed_filenames)[:5]
+                logger.warning(f"NZB filenames sample: {sample}")
 
         try:
             patterns = ['*.rar', '*.r[0-9][0-9]', '*.zip', '*.7z', '*.par2',
-                       '*.PAR2', '*.part*.rar', '*.sfv', '*.SFV']
+                       '*.PAR2', '*.part*.rar', '*.sfv', '*.SFV',
+                       # PAR2 backup files (created during repair): *.flac.1, *.mp3.1, etc.
+                       '*.[0-9]', '*.[0-9][0-9]']
 
+            files_found = []
             for pattern in patterns:
-                for file in search_dir.glob(pattern):
-                    # If allowed_filenames is set, only delete files from this NZB
-                    if allowed_lower is not None:
-                        if file.name.lower() not in allowed_lower:
-                            logger.debug(f"Skipping cleanup of {file.name} (not in NZB)")
-                            continue
+                files_found.extend(search_dir.glob(pattern))
 
-                    try:
-                        file.unlink()
-                        removed += 1
-                    except:
-                        pass
+            if files_found:
+                sample_files = [f.name for f in files_found[:5]]
+                logger.info(f"Files on disk ({len(files_found)}): {sample_files}")
+
+            for file in files_found:
+                file_normalized = _normalize_filename(file.name)
+
+                # If allowed_filenames is set, only delete files from this NZB
+                if allowed_normalized:
+                    # Try normalized match first
+                    if file_normalized in allowed_normalized:
+                        pass  # Match found, proceed to delete
+                    # Fallback: match by prefix (fully normalized)
+                    elif allowed_prefixes:
+                        file_base = re.sub(r'\.(part\d+|vol\d+[+\d]*|r\d+|par2|rar|zip|7z|sfv|nfo|flac|mp3|jpg|png).*$', '', file_normalized)
+                        if not any(file_base.startswith(prefix) or prefix.startswith(file_base) for prefix in allowed_prefixes):
+                            logger.debug(f"Skipping cleanup of {file.name} (not matching NZB)")
+                            continue
+                    else:
+                        logger.debug(f"Skipping cleanup of {file.name} (not in NZB)")
+                        continue
+
+                try:
+                    file.unlink()
+                    removed += 1
+                except Exception as e:
+                    logger.debug(f"Could not delete {file.name}: {e}")
 
             logger.info(f"Cleaned up {removed} files")
 
@@ -1325,10 +1455,25 @@ class PostProcessor:
 
         return removed
 
-    # Media file extensions to move to final destination
-    MEDIA_EXTENSIONS = {'.mkv', '.avi', '.mp4', '.m4v', '.mov', '.wmv', '.flv',
-                        '.webm', '.mpg', '.mpeg', '.m2ts', '.ts', '.vob',
-                        '.iso', '.img', '.nfo', '.srt', '.sub', '.idx', '.ass'}
+    # Media file extensions to move to final destination (video, audio, subtitles, images)
+    MEDIA_EXTENSIONS = {
+        # Video
+        '.mkv', '.avi', '.mp4', '.m4v', '.mov', '.wmv', '.flv',
+        '.webm', '.mpg', '.mpeg', '.m2ts', '.ts', '.vob',
+        '.iso', '.img',
+        # Audio
+        '.flac', '.mp3', '.wav', '.aac', '.m4a', '.ogg', '.opus',
+        '.wma', '.alac', '.ape', '.aiff', '.dsd', '.dsf', '.dff',
+        '.mqa', '.cue',  # Lossless/Hi-Res audio formats
+        # Playlists
+        '.m3u', '.m3u8', '.pls', '.xspf',
+        # Subtitles
+        '.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt',
+        # Info/metadata
+        '.nfo', '.txt', '.log',
+        # Cover images
+        '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp',
+    }
 
     def _is_archive(self, file: Path) -> bool:
         """Check if file is an archive."""
@@ -1407,6 +1552,60 @@ class PostProcessor:
         logger.info(f"Moved {batch_result.successful} media file(s) to {dest_folder.name}/")
         return batch_result.successful
 
+    def _derive_filenames_from_disk(
+        self,
+        directory: Path,
+        release_title: str
+    ) -> Set[str]:
+        """
+        Derive cleanup filenames from files on disk when NZB has obfuscated subjects.
+
+        This scans the download directory for archive/par2 files and matches them
+        against the release title to find files belonging to this download.
+
+        Args:
+            directory: Download directory to scan
+            release_title: Release title from NZB metadata (e.g., "Release.Name-GROUP")
+
+        Returns:
+            Set of filenames that match the release title
+        """
+        if not release_title:
+            return set()
+
+        # Normalize release title for matching
+        title_normalized = _normalize_filename(release_title)
+        # Also create a version without group suffix for broader matching
+        title_base = re.sub(r'[-_](gog|codex|plaza|skidrow|fitgirl|dodi|elamigos|rune|razor1911|p2p)$',
+                           '', title_normalized, flags=re.IGNORECASE)
+
+        logger.debug(f"Disk cleanup: looking for files matching '{title_normalized}' or '{title_base}'")
+
+        matching_files = set()
+
+        # Scan for archive patterns
+        patterns = ['*.rar', '*.r[0-9][0-9]', '*.zip', '*.7z', '*.par2',
+                   '*.PAR2', '*.part*.rar', '*.sfv', '*.SFV',
+                   '*.[0-9]', '*.[0-9][0-9]']
+
+        for pattern in patterns:
+            for file in directory.glob(pattern):
+                file_normalized = _normalize_filename(file.stem)
+
+                # Check if file matches release title
+                # Use contains check for flexibility with different naming conventions
+                if (title_normalized in file_normalized or
+                    title_base in file_normalized or
+                    file_normalized.startswith(title_normalized[:20]) or  # First 20 chars
+                    file_normalized.startswith(title_base[:20])):
+                    matching_files.add(file.name)
+
+        if matching_files:
+            sample = list(matching_files)[:5]
+            logger.info(f"Disk-based cleanup found {len(matching_files)} files: {sample}")
+
+        return matching_files
+
     def _copy_nfo_files(
         self,
         source_dir: Path,
@@ -1432,8 +1631,28 @@ class PostProcessor:
 
         # Filter to only NFOs from this NZB if allowed_filenames is set
         if allowed_filenames:
-            allowed_lower = {f.lower() for f in allowed_filenames}
-            nfo_files = [f for f in nfo_files if f.name.lower() in allowed_lower]
+            # Build allowed set with normalized names (handles spaces, underscores, parentheses)
+            allowed_normalized = set()
+            for f in allowed_filenames:
+                allowed_normalized.add(_normalize_filename(f))
+
+            # Also extract prefixes for fallback matching (normalized)
+            allowed_prefixes = set()
+            for fname in allowed_filenames:
+                base = re.sub(r'\.(part\d+|vol\d+[+\d]*|r\d+|par2|rar|zip|7z|sfv|nfo|flac|mp3|jpg|png).*$', '', fname.lower())
+                if base and len(base) > 5:
+                    allowed_prefixes.add(_normalize_filename(base))
+
+            def matches_nzb(nfo_name: str) -> bool:
+                nfo_normalized = _normalize_filename(nfo_name)
+                # Exact match (normalized)
+                if nfo_normalized in allowed_normalized:
+                    return True
+                # Prefix match (normalized)
+                nfo_base = _normalize_filename(nfo_name.replace('.nfo', ''))
+                return any(nfo_base.startswith(p) or p.startswith(nfo_base) for p in allowed_prefixes)
+
+            nfo_files = [f for f in nfo_files if matches_nzb(f.name)]
 
         if not nfo_files:
             return 0
@@ -1963,17 +2182,26 @@ class PostProcessor:
 
             # Step 4: Cleanup (optional) - ONLY files from this NZB
             if self.cleanup_after_extract and result.files_extracted > 0:
+                self._report_progress("Cleaning up...", 95)
+
                 if metadata.filenames:
-                    self._report_progress("Cleaning up...", 95)
+                    # Normal path: use NZB filenames
                     nzb_filenames = set(metadata.filenames)
                     self.cleanup_archives(src_dir, nzb_filenames)
                 else:
-                    # No NZB filenames extracted - skip cleanup for safety
-                    logger.warning("Skipping cleanup: could not extract filenames from NZB (manual cleanup required)")
-                    result.warnings.append((
-                        WarningType.CLEANUP_SKIPPED,
-                        "Cleanup skipped - manual cleanup required"
-                    ))
+                    # Fallback: derive filenames from disk using release title
+                    # This handles obfuscated NZB subjects where filenames couldn't be parsed
+                    logger.info("No NZB filenames - using disk-based cleanup with title matching")
+                    disk_filenames = self._derive_filenames_from_disk(src_dir, metadata.title)
+                    if disk_filenames:
+                        logger.info(f"Found {len(disk_filenames)} matching files on disk for cleanup")
+                        self.cleanup_archives(src_dir, disk_filenames)
+                    else:
+                        logger.warning("Skipping cleanup: could not match files on disk to release title")
+                        result.warnings.append((
+                            WarningType.CLEANUP_SKIPPED,
+                            "Cleanup skipped - manual cleanup required"
+                        ))
 
             # Success!
             result.success = True
