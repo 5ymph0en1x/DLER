@@ -43,6 +43,35 @@ else:
     SUBPROCESS_FLAGS = 0
 
 
+def _extract_filename_from_subject(subject: str) -> Optional[str]:
+    """
+    Extract filename from NZB subject line.
+
+    Subject formats vary but commonly include:
+    - "release name" filename.ext yEnc (1/10)
+    - [group] release - "filename.ext" yEnc
+    """
+    if not subject:
+        return None
+
+    # Try to find filename in quotes
+    quoted = re.search(r'"([^"]+\.[a-zA-Z0-9]{2,7})"', subject)
+    if quoted:
+        return quoted.group(1)
+
+    # Try to find filename before yEnc marker
+    yenc_match = re.search(r'([^\s"]+\.[a-zA-Z0-9]{2,7})\s*yEnc', subject, re.IGNORECASE)
+    if yenc_match:
+        return yenc_match.group(1)
+
+    # Try to find any filename pattern
+    file_match = re.search(r'([^\s"<>|]+\.(rar|r\d{2,3}|zip|7z|par2|nfo|sfv|nzb|mkv|avi|mp4|iso))', subject, re.IGNORECASE)
+    if file_match:
+        return file_match.group(1)
+
+    return None
+
+
 class PostProcessStatus(Enum):
     """Post-processing status."""
     PENDING = "pending"
@@ -62,6 +91,7 @@ class WarningType(Enum):
     PASSWORD_REQUIRED = "password_required"   # Archive needs password
     EXTRACTION_PARTIAL = "extraction_partial" # Some files failed to extract
     DISK_SPACE_LOW = "disk_space"            # Low disk space warning
+    CLEANUP_SKIPPED = "cleanup_skipped"      # Cleanup skipped (NZB parsing failed)
 
 
 @dataclass
@@ -78,6 +108,16 @@ class PostProcessResult:
     warnings: List[Tuple[WarningType, str]] = field(default_factory=list)
     duration_seconds: float = 0.0
     antivirus_blocked_files: List[str] = field(default_factory=list)
+    # Performance metrics
+    extraction_duration_seconds: float = 0.0
+    extracted_bytes: int = 0
+
+    @property
+    def extraction_speed_mbs(self) -> float:
+        """Extraction speed in MB/s."""
+        if self.extraction_duration_seconds > 0 and self.extracted_bytes > 0:
+            return (self.extracted_bytes / (1024 * 1024)) / self.extraction_duration_seconds
+        return 0.0
 
 
 @dataclass
@@ -87,6 +127,7 @@ class NZBMetadata:
     password: str = ""
     category: str = ""
     group: str = ""
+    filenames: List[str] = field(default_factory=list)  # List of files in NZB
 
 
 class MoveResult:
@@ -152,6 +193,690 @@ def robust_move_file(src: Path, dest: Path, max_retries: int = 3, delay: float =
             return result
 
     return result
+
+
+@dataclass
+class BatchMoveResult:
+    """Result of batch file move operation."""
+    total_files: int = 0
+    successful: int = 0
+    failed: int = 0
+    av_blocked: int = 0
+    copied_only: int = 0  # Copied but source not deleted (AV lock)
+    results: List[MoveResult] = field(default_factory=list)
+    duration_seconds: float = 0.0
+
+    @property
+    def success_rate(self) -> float:
+        """Percentage of successful moves."""
+        return self.successful / max(1, self.total_files)
+
+
+def batch_move_files(
+    file_pairs: List[Tuple[Path, Path]],
+    max_workers: int = 8,
+    max_retries: int = 3,
+    delay: float = 0.5,
+    on_progress: Optional[Callable[[int, int], None]] = None
+) -> BatchMoveResult:
+    """
+    Move multiple files in parallel using ThreadPoolExecutor.
+
+    Significantly faster than sequential moves for large file batches.
+    Maintains AV lock retry logic per file.
+
+    Args:
+        file_pairs: List of (source, destination) path tuples
+        max_workers: Number of parallel workers (default: 8)
+        max_retries: Retries per file for AV locks
+        delay: Delay between retries (seconds)
+        on_progress: Callback (completed, total) for progress updates
+
+    Returns:
+        BatchMoveResult with aggregated statistics
+    """
+    if not file_pairs:
+        return BatchMoveResult()
+
+    start_time = time.time()
+    num_workers = min(max_workers, len(file_pairs))
+    results: List[Optional[MoveResult]] = [None] * len(file_pairs)
+    completed_count = [0]  # Mutable for closure
+    lock = threading.Lock()
+
+    def move_with_index(args: Tuple[int, Tuple[Path, Path]]) -> Tuple[int, MoveResult]:
+        idx, (src, dest) = args
+        result = robust_move_file(src, dest, max_retries, delay)
+
+        with lock:
+            completed_count[0] += 1
+            if on_progress:
+                try:
+                    on_progress(completed_count[0], len(file_pairs))
+                except Exception:
+                    pass
+
+        return idx, result
+
+    # Parallel execution
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [
+            executor.submit(move_with_index, (i, pair))
+            for i, pair in enumerate(file_pairs)
+        ]
+
+        for future in as_completed(futures):
+            try:
+                idx, result = future.result()
+                results[idx] = result
+            except Exception as e:
+                logger.error(f"Batch move worker error: {e}")
+
+    # Aggregate results
+    batch_result = BatchMoveResult(
+        total_files=len(file_pairs),
+        duration_seconds=time.time() - start_time
+    )
+
+    for r in results:
+        if r is None:
+            batch_result.failed += 1
+            continue
+
+        batch_result.results.append(r)
+
+        if r.success:
+            batch_result.successful += 1
+            if r.av_blocked:
+                batch_result.copied_only += 1
+        elif r.av_blocked:
+            batch_result.av_blocked += 1
+            batch_result.failed += 1
+        else:
+            batch_result.failed += 1
+
+    logger.info(
+        f"Batch move: {batch_result.successful}/{batch_result.total_files} files "
+        f"in {batch_result.duration_seconds:.1f}s "
+        f"({batch_result.av_blocked} AV-blocked)"
+    )
+
+    return batch_result
+
+
+@dataclass
+class ExtractionResult:
+    """Result of a single archive extraction."""
+    archive: Path
+    success: bool
+    files_extracted: int
+    message: str
+    duration: float
+
+
+class ParallelExtractor:
+    """
+    Parallel archive extraction with resource balancing.
+
+    Extracts multiple archives concurrently using ThreadPoolExecutor,
+    while balancing 7z thread usage to avoid resource contention.
+    """
+
+    def __init__(
+        self,
+        sevenzip_path: str,
+        max_parallel: int = 3,
+        threads_per_extraction: int = 4,
+        on_progress: Optional[Callable[[str, float], None]] = None
+    ):
+        """
+        Initialize parallel extractor.
+
+        Args:
+            sevenzip_path: Path to 7z executable
+            max_parallel: Max concurrent extraction processes (2-4 recommended)
+            threads_per_extraction: Threads per 7z instance (-mmt flag)
+            on_progress: Progress callback (message, percent)
+        """
+        self.sevenzip_path = sevenzip_path
+        self.max_parallel = max_parallel
+        self.threads_per_extraction = threads_per_extraction
+        self.on_progress = on_progress
+        self._lock = threading.Lock()
+        self._completed = 0
+        self._total = 0
+
+    def _report_progress(self, message: str, percent: float) -> None:
+        """Report progress to callback."""
+        if self.on_progress:
+            try:
+                self.on_progress(message, percent)
+            except Exception:
+                pass
+
+    def _extract_single(
+        self,
+        archive: Path,
+        output_dir: Path,
+        password: Optional[str],
+        index: int
+    ) -> ExtractionResult:
+        """
+        Extract single archive (worker function).
+
+        Args:
+            archive: Archive file to extract
+            output_dir: Output directory
+            password: Optional password
+            index: Archive index for progress
+
+        Returns:
+            ExtractionResult with details
+        """
+        start_time = time.time()
+
+        try:
+            # Build 7z command with reduced thread count for parallel execution
+            cmd = [
+                self.sevenzip_path,
+                'x',  # Extract with full paths
+                '-y',  # Yes to all prompts
+                '-bb0',  # Less output
+                '-bd',  # No progress indicator
+                f'-o{output_dir}',  # Output directory
+                f'-mmt={self.threads_per_extraction}',  # Reduced threads
+            ]
+
+            # Add password
+            if password:
+                cmd.append(f'-p{password}')
+            else:
+                cmd.append('-p')  # Empty password (skip prompts)
+
+            cmd.append(str(archive))
+
+            logger.debug(f"Parallel extract [{index}]: {archive.name}")
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(archive.parent),
+                timeout=7200,  # 2 hours max
+                creationflags=SUBPROCESS_FLAGS
+            )
+
+            elapsed = time.time() - start_time
+
+            # Update progress
+            with self._lock:
+                self._completed += 1
+                pct = (self._completed / max(1, self._total)) * 100
+                self._report_progress(
+                    f"Extracting: {self._completed}/{self._total}",
+                    pct
+                )
+
+            if result.returncode == 0:
+                # Count extracted files (estimate based on output)
+                files_count = result.stdout.count('Extracting') if result.stdout else 1
+                return ExtractionResult(
+                    archive=archive,
+                    success=True,
+                    files_extracted=max(1, files_count),
+                    message=f"OK ({elapsed:.1f}s)",
+                    duration=elapsed
+                )
+            else:
+                error_msg = result.stderr or result.stdout or "Unknown error"
+                if 'Wrong password' in error_msg or 'password' in error_msg.lower():
+                    return ExtractionResult(
+                        archive=archive,
+                        success=False,
+                        files_extracted=0,
+                        message="Wrong password",
+                        duration=elapsed
+                    )
+                return ExtractionResult(
+                    archive=archive,
+                    success=False,
+                    files_extracted=0,
+                    message=f"Failed: {error_msg[:100]}",
+                    duration=elapsed
+                )
+
+        except subprocess.TimeoutExpired:
+            return ExtractionResult(
+                archive=archive,
+                success=False,
+                files_extracted=0,
+                message="Timeout",
+                duration=time.time() - start_time
+            )
+        except Exception as e:
+            return ExtractionResult(
+                archive=archive,
+                success=False,
+                files_extracted=0,
+                message=str(e),
+                duration=time.time() - start_time
+            )
+
+    def extract_parallel(
+        self,
+        archives: List[Path],
+        output_dir: Path,
+        password: Optional[str] = None
+    ) -> List[ExtractionResult]:
+        """
+        Extract multiple archives in parallel.
+
+        Args:
+            archives: List of archive files
+            output_dir: Output directory (shared for all)
+            password: Optional password (same for all)
+
+        Returns:
+            List of ExtractionResult for each archive
+        """
+        if not archives:
+            return []
+
+        self._completed = 0
+        self._total = len(archives)
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        num_workers = min(self.max_parallel, len(archives))
+        results: List[Optional[ExtractionResult]] = [None] * len(archives)
+
+        logger.info(
+            f"Parallel extraction: {len(archives)} archives, "
+            f"{num_workers} workers, {self.threads_per_extraction} threads each"
+        )
+        self._report_progress(f"Extracting {len(archives)} archives...", 0)
+
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {
+                executor.submit(
+                    self._extract_single, archive, output_dir, password, i
+                ): i
+                for i, archive in enumerate(archives)
+            }
+
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    logger.error(f"Parallel extract worker error: {e}")
+                    results[idx] = ExtractionResult(
+                        archive=archives[idx],
+                        success=False,
+                        files_extracted=0,
+                        message=str(e),
+                        duration=0
+                    )
+
+        # Log summary
+        successful = sum(1 for r in results if r and r.success)
+        total_time = sum(r.duration for r in results if r)
+        logger.info(
+            f"Parallel extraction complete: {successful}/{len(archives)} OK, "
+            f"total time {total_time:.1f}s"
+        )
+
+        return [r for r in results if r is not None]
+
+    @staticmethod
+    def calculate_optimal_params(ram_gb: float = 0) -> Tuple[int, int]:
+        """
+        Calculate optimal parallel extraction parameters.
+
+        Args:
+            ram_gb: System RAM in GB (0 = auto-detect)
+
+        Returns:
+            (max_parallel, threads_per_extraction)
+        """
+        cpu_count = os.cpu_count() or 8
+
+        # Auto-detect RAM
+        if ram_gb <= 0:
+            try:
+                import psutil
+                ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+            except ImportError:
+                ram_gb = 16  # Conservative default
+
+        # Scale based on RAM and CPU
+        if ram_gb >= 48:
+            return 4, max(4, cpu_count // 4)
+        elif ram_gb >= 24:
+            return 3, max(4, cpu_count // 3)
+        elif ram_gb >= 12:
+            return 2, max(2, cpu_count // 4)
+        else:
+            return 1, max(2, cpu_count // 2)  # Sequential fallback
+
+
+def detect_hardware_config() -> Dict[str, any]:
+    """
+    Auto-detect hardware configuration for optimal settings.
+
+    Returns:
+        Dict with cpu_count, ram_gb, recommended settings
+    """
+    cpu_count = os.cpu_count() or 8
+
+    # Detect RAM
+    ram_gb = 16  # Default
+    try:
+        import psutil
+        ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+    except ImportError:
+        pass
+
+    # Calculate optimal settings based on hardware
+    if ram_gb >= 48 and cpu_count >= 16:
+        # High-end system (like user's 64GB + many cores)
+        config = {
+            'parallel_extractions': 4,
+            'threads_per_extraction': max(6, cpu_count // 4),
+            'parallel_move_threads': min(16, cpu_count),
+            'par2_threads': cpu_count,
+            'profile': 'high_end'
+        }
+    elif ram_gb >= 24 and cpu_count >= 8:
+        # Mid-high system
+        config = {
+            'parallel_extractions': 3,
+            'threads_per_extraction': max(4, cpu_count // 3),
+            'parallel_move_threads': min(12, cpu_count),
+            'par2_threads': cpu_count,
+            'profile': 'mid_high'
+        }
+    elif ram_gb >= 12 and cpu_count >= 4:
+        # Mid system
+        config = {
+            'parallel_extractions': 2,
+            'threads_per_extraction': max(2, cpu_count // 4),
+            'parallel_move_threads': 8,
+            'par2_threads': min(8, cpu_count),
+            'profile': 'mid'
+        }
+    else:
+        # Low-end system
+        config = {
+            'parallel_extractions': 1,
+            'threads_per_extraction': max(2, cpu_count // 2),
+            'parallel_move_threads': 4,
+            'par2_threads': min(4, cpu_count),
+            'profile': 'low_end'
+        }
+
+    config['cpu_count'] = cpu_count
+    config['ram_gb'] = ram_gb
+
+    logger.info(f"Hardware detected: {cpu_count} cores, {ram_gb:.1f} GB RAM → profile: {config['profile']}")
+
+    return config
+
+
+def are_on_same_drive(path1: Path, path2: Path) -> bool:
+    """Check if two paths are on the same drive (Windows) or mount point."""
+    try:
+        if sys.platform == 'win32':
+            # Windows: compare drive letters
+            drive1 = Path(path1).resolve().drive.upper()
+            drive2 = Path(path2).resolve().drive.upper()
+            return drive1 == drive2
+        else:
+            # Unix: compare mount points using os.stat
+            import os
+            return os.stat(path1).st_dev == os.stat(path2).st_dev
+    except Exception:
+        return True  # Assume same drive if can't determine
+
+
+class StreamingPostProcessor:
+    """
+    Post-processor that starts PAR2 verification during download.
+
+    Monitors file completion events from the download engine and
+    starts PAR2 verification as soon as PAR2 files are complete,
+    enabling early detection of missing or corrupted segments.
+
+    Usage:
+        streaming_pp = StreamingPostProcessor(
+            download_dir=Path("downloads"),
+            on_early_issue=lambda msg: print(f"Warning: {msg}")
+        )
+
+        # Register with engine
+        engine.on_file_complete = streaming_pp.on_file_complete
+
+        # After download, check for early result
+        early_result = streaming_pp.get_early_result()
+    """
+
+    def __init__(
+        self,
+        download_dir: Path,
+        par2_path: Optional[str] = None,
+        threads: int = 0,
+        on_early_issue: Optional[Callable[[str], None]] = None,
+        on_progress: Optional[Callable[[str, float], None]] = None
+    ):
+        """
+        Initialize streaming post-processor.
+
+        Args:
+            download_dir: Directory where files are being downloaded
+            par2_path: Path to PAR2 executable (auto-detect if None)
+            threads: PAR2 threads (0 = auto)
+            on_early_issue: Callback when PAR2 detects issues early
+            on_progress: Progress callback (message, percent)
+        """
+        self.download_dir = Path(download_dir)
+        self.par2_path = par2_path or self._find_par2()
+        self.threads = threads or os.cpu_count() or 8
+        self.on_early_issue = on_early_issue
+        self.on_progress = on_progress
+
+        # State tracking
+        self._completed_files: Set[Path] = set()
+        self._par2_main_file: Optional[Path] = None
+        self._par2_started = False
+        self._par2_result: Optional[Tuple[bool, bool, str]] = None
+        self._par2_thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+        logger.info(f"StreamingPostProcessor initialized: PAR2={self.par2_path or 'NOT FOUND'}")
+
+    def _find_par2(self) -> Optional[str]:
+        """Find PAR2 executable."""
+        # Check bundled tools first
+        if hasattr(sys, '_MEIPASS'):
+            bundled = Path(sys._MEIPASS) / 'tools' / 'par2j64.exe'
+        else:
+            bundled = Path(__file__).parent.parent.parent / 'tools' / 'par2j64.exe'
+
+        if bundled.exists():
+            return str(bundled)
+
+        # Check common paths
+        paths = [
+            r"par2.exe",
+            r"C:\Program Files\MultiPar\par2j64.exe",
+            r"C:\Program Files (x86)\MultiPar\par2j64.exe",
+        ]
+
+        for path in paths:
+            if not os.path.isabs(path):
+                result = shutil.which(path)
+                if result:
+                    return result
+            elif Path(path).exists():
+                return path
+
+        return None
+
+    def _is_main_par2(self, file_path: Path) -> bool:
+        """Check if file is main PAR2 (not volume)."""
+        name = file_path.name.lower()
+        return name.endswith('.par2') and '.vol' not in name
+
+    def on_file_complete(self, file_path: Path, filename: str) -> None:
+        """
+        Called when a file finishes downloading.
+
+        This is the callback registered with TurboEngineV2.on_file_complete.
+
+        Args:
+            file_path: Path to completed file
+            filename: Original filename from NZB
+        """
+        with self._lock:
+            self._completed_files.add(file_path)
+
+        # Check if this is a main PAR2 file
+        if self._is_main_par2(file_path) and not self._par2_started:
+            logger.info(f"Main PAR2 file complete: {file_path.name}")
+            self._start_early_par2(file_path)
+
+    def _start_early_par2(self, par2_file: Path) -> None:
+        """Start PAR2 verification in background thread."""
+        if not self.par2_path:
+            logger.warning("PAR2 not available for streaming verification")
+            return
+
+        with self._lock:
+            if self._par2_started:
+                return
+            self._par2_started = True
+            self._par2_main_file = par2_file
+
+        def verify_thread():
+            try:
+                logger.info(f"Starting early PAR2 verification: {par2_file.name}")
+
+                if self.on_progress:
+                    self.on_progress("Early PAR2 verification...", -1)
+
+                # Run PAR2 verify (NOT repair - just check)
+                result = self._run_par2_verify(par2_file)
+
+                with self._lock:
+                    self._par2_result = result
+
+                verified, _, message = result
+
+                if verified:
+                    logger.info(f"Early PAR2 OK: {message}")
+                else:
+                    logger.warning(f"Early PAR2 issue: {message}")
+                    if self.on_early_issue:
+                        try:
+                            self.on_early_issue(f"PAR2 issue detected: {message}")
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                logger.error(f"Early PAR2 error: {e}")
+                with self._lock:
+                    self._par2_result = (False, False, str(e))
+
+        self._par2_thread = threading.Thread(
+            target=verify_thread,
+            name="StreamingPAR2",
+            daemon=True
+        )
+        self._par2_thread.start()
+
+    def _run_par2_verify(self, par2_file: Path) -> Tuple[bool, bool, str]:
+        """
+        Run PAR2 verification only (no repair).
+
+        Returns:
+            (verified_ok, repaired, message)
+        """
+        try:
+            cmd = [
+                self.par2_path,
+                'verify',  # Verify only, no repair
+                '-q',  # Quiet
+                f'-t{self.threads}',
+                str(par2_file)
+            ]
+
+            logger.debug(f"Running early PAR2: {' '.join(cmd)}")
+            start_time = time.time()
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(par2_file.parent),
+                timeout=1800,  # 30 min max for early check
+                creationflags=SUBPROCESS_FLAGS
+            )
+
+            elapsed = time.time() - start_time
+
+            if result.returncode == 0:
+                return True, False, f"Verified OK ({elapsed:.1f}s)"
+            else:
+                # Check output for details
+                output = result.stderr or result.stdout or ""
+
+                # Missing blocks can be recovered with more PAR2 volumes
+                if 'repair is required' in output.lower() or result.returncode == 1:
+                    return False, False, f"Repair needed ({elapsed:.1f}s)"
+                elif 'repair is not possible' in output.lower():
+                    return False, False, f"Repair not possible - missing data"
+                else:
+                    return False, False, f"Verify failed: {output[:100]}"
+
+        except subprocess.TimeoutExpired:
+            return False, False, "Verification timeout"
+        except Exception as e:
+            return False, False, str(e)
+
+    def get_early_result(self) -> Optional[Tuple[bool, bool, str]]:
+        """
+        Get result of early PAR2 verification if available.
+
+        Returns:
+            (verified_ok, repaired, message) or None if not yet complete
+        """
+        with self._lock:
+            return self._par2_result
+
+    def wait_for_par2(self, timeout: float = 60) -> bool:
+        """
+        Wait for early PAR2 verification to complete.
+
+        Args:
+            timeout: Max seconds to wait
+
+        Returns:
+            True if PAR2 completed (check get_early_result for status)
+        """
+        if self._par2_thread:
+            self._par2_thread.join(timeout=timeout)
+            return not self._par2_thread.is_alive()
+        return True
+
+    def is_par2_complete(self) -> bool:
+        """Check if early PAR2 verification has finished."""
+        with self._lock:
+            return self._par2_result is not None
+
+    def get_completed_files(self) -> Set[Path]:
+        """Get set of completed file paths."""
+        with self._lock:
+            return self._completed_files.copy()
 
 
 class PostProcessor:
@@ -331,7 +1056,24 @@ class PostProcessor:
             if not metadata.title:
                 metadata.title = nzb_path.stem
 
-            logger.info(f"NZB Metadata: title={metadata.title}, password={'***' if metadata.password else 'None'}")
+            # Extract filenames from NZB <file> elements
+            # Try with namespace first
+            for file_elem in root.findall('.//nzb:file', ns):
+                subject = file_elem.get('subject', '')
+                # Extract filename from subject (usually in quotes or after yEnc)
+                filename = _extract_filename_from_subject(subject)
+                if filename:
+                    metadata.filenames.append(filename)
+
+            # Try without namespace
+            if not metadata.filenames:
+                for file_elem in root.findall('.//file'):
+                    subject = file_elem.get('subject', '')
+                    filename = _extract_filename_from_subject(subject)
+                    if filename:
+                        metadata.filenames.append(filename)
+
+            logger.info(f"NZB Metadata: title={metadata.title}, password={'***' if metadata.password else 'None'}, files={len(metadata.filenames)}")
 
         except Exception as e:
             logger.error(f"Failed to parse NZB metadata: {e}")
@@ -539,17 +1281,37 @@ class PostProcessor:
             logger.error(f"Extraction error: {e}")
             return False, 0, f"Error: {e}"
 
-    def cleanup_archives(self, directory: Optional[Path] = None) -> int:
-        """Remove archive files and PAR2 files after successful extraction."""
+    def cleanup_archives(
+        self,
+        directory: Optional[Path] = None,
+        allowed_filenames: Optional[Set[str]] = None
+    ) -> int:
+        """
+        Remove archive files, PAR2 files, and SFV files after successful extraction.
+
+        Args:
+            directory: Directory to clean (default: download_dir)
+            allowed_filenames: If provided, only delete files whose names are in this set.
+                              This ensures cleanup is specific to the current NZB.
+        """
         search_dir = directory or self.download_dir
         removed = 0
 
+        # Convert to lowercase set for case-insensitive matching
+        allowed_lower = {f.lower() for f in allowed_filenames} if allowed_filenames else None
+
         try:
             patterns = ['*.rar', '*.r[0-9][0-9]', '*.zip', '*.7z', '*.par2',
-                       '*.PAR2', '*.part*.rar']
+                       '*.PAR2', '*.part*.rar', '*.sfv', '*.SFV']
 
             for pattern in patterns:
                 for file in search_dir.glob(pattern):
+                    # If allowed_filenames is set, only delete files from this NZB
+                    if allowed_lower is not None:
+                        if file.name.lower() not in allowed_lower:
+                            logger.debug(f"Skipping cleanup of {file.name} (not in NZB)")
+                            continue
+
                     try:
                         file.unlink()
                         removed += 1
@@ -585,7 +1347,7 @@ class PostProcessor:
     def _move_media_files(self, src_dir: Path, release_name: Optional[str] = None) -> int:
         """
         Move media files (MKV, AVI, etc.) to the final destination.
-        Used when there are no archives to extract.
+        Uses parallel batch move for performance.
 
         Args:
             src_dir: Source directory containing downloaded files
@@ -598,7 +1360,9 @@ class PostProcessor:
         dest_folder = self.extract_dir / (release_name or "media")
         dest_folder.mkdir(parents=True, exist_ok=True)
 
-        moved = 0
+        # Collect all files to move
+        file_pairs: List[Tuple[Path, Path]] = []
+
         for file in src_dir.iterdir():
             if not file.is_file():
                 continue
@@ -608,7 +1372,7 @@ class PostProcessor:
             if suffix == '.par2' or self._is_archive(file):
                 continue
 
-            # Move media files
+            # Collect media files
             if self._is_media_file(file):
                 target = dest_folder / file.name
 
@@ -620,12 +1384,86 @@ class PostProcessor:
                         target = dest_folder / f"{base}_{counter}{ext}"
                         counter += 1
 
-                move_result = robust_move_file(file, target)
-                if move_result.success or move_result.copied:
-                    logger.info(f"Moved: {file.name} → {dest_folder.name}/")
-                    moved += 1
+                file_pairs.append((file, target))
 
-        return moved
+        if not file_pairs:
+            return 0
+
+        # Batch move with progress
+        def move_progress(done: int, total: int) -> None:
+            self._report_progress(f"Moving media: {done}/{total}", 80 + (15 * done / total))
+
+        batch_result = batch_move_files(
+            file_pairs,
+            max_workers=min(8, len(file_pairs)),
+            on_progress=move_progress
+        )
+
+        # Track AV-blocked files
+        for r in batch_result.results:
+            if r.av_blocked and r.error:
+                self._av_blocked_files.add(r.error)
+
+        logger.info(f"Moved {batch_result.successful} media file(s) to {dest_folder.name}/")
+        return batch_result.successful
+
+    def _copy_nfo_files(
+        self,
+        source_dir: Path,
+        dest_dir: Path,
+        allowed_filenames: Optional[Set[str]] = None
+    ) -> int:
+        """
+        Copy NFO files from source directory to destination if not already present.
+
+        Args:
+            source_dir: Directory containing NFO files (download dir)
+            dest_dir: Destination directory (extracted content)
+            allowed_filenames: If provided, only copy NFOs whose names are in this set.
+
+        Returns:
+            Number of NFO files copied
+        """
+        if not dest_dir or not dest_dir.exists():
+            return 0
+
+        # Find NFO files in source directory (non-recursive)
+        nfo_files = list(source_dir.glob('*.nfo'))
+
+        # Filter to only NFOs from this NZB if allowed_filenames is set
+        if allowed_filenames:
+            allowed_lower = {f.lower() for f in allowed_filenames}
+            nfo_files = [f for f in nfo_files if f.name.lower() in allowed_lower]
+
+        if not nfo_files:
+            return 0
+
+        # Check existing NFO files in destination
+        existing_nfos = {f.name.lower() for f in dest_dir.rglob('*.nfo')}
+
+        copied = 0
+        for nfo in nfo_files:
+            if nfo.name.lower() not in existing_nfos:
+                try:
+                    dest_path = dest_dir / nfo.name
+                    shutil.copy2(nfo, dest_path)
+                    logger.info(f"Copied NFO: {nfo.name} → {dest_dir.name}/")
+                    copied += 1
+
+                    # Delete NFO from source after successful copy
+                    try:
+                        nfo.unlink()
+                        logger.debug(f"Deleted source NFO: {nfo.name}")
+                    except Exception as e:
+                        logger.debug(f"Could not delete source NFO {nfo.name}: {e}")
+
+                except Exception as e:
+                    logger.warning(f"Failed to copy NFO {nfo.name}: {e}")
+
+        if copied > 0:
+            logger.info(f"Copied {copied} NFO file(s) to extracted content")
+
+        return copied
 
     def _find_nested_archives(self, directory: Path) -> List[Path]:
         """Find archives in extracted content (for nested extraction)."""
@@ -669,11 +1507,19 @@ class PostProcessor:
     def extract_all_to_temp(
         self,
         archives: List[Path],
-        password: Optional[str] = None
+        password: Optional[str] = None,
+        parallel: bool = True,
+        max_parallel: int = 3
     ) -> Tuple[Path, bool]:
         """
         Extract ALL archives to a single temp directory.
-        This allows multi-part RARs split across ZIPs to be combined.
+        Uses parallel extraction for multiple archives.
+
+        Args:
+            archives: List of archive files
+            password: Optional archive password
+            parallel: Use parallel extraction (default: True)
+            max_parallel: Max concurrent extractions (default: 3)
 
         Returns:
             (temp_dir, success)
@@ -683,13 +1529,119 @@ class PostProcessor:
             shutil.rmtree(temp_dir, ignore_errors=True)
         temp_dir.mkdir(parents=True, exist_ok=True)
 
-        for archive in archives:
-            self._report_progress(f"Extracting: {archive.name}", 50)
-            success, _, msg = self.extract_archive(archive, password, temp_dir)
-            if not success:
-                logger.warning(f"Failed to extract {archive.name}: {msg}")
+        # Use parallel extraction for multiple archives
+        if parallel and len(archives) > 1 and self.sevenzip_path:
+            # Calculate optimal parameters
+            max_par, threads_per = ParallelExtractor.calculate_optimal_params()
+            max_par = min(max_par, max_parallel, len(archives))
 
-        return temp_dir, True
+            extractor = ParallelExtractor(
+                sevenzip_path=self.sevenzip_path,
+                max_parallel=max_par,
+                threads_per_extraction=threads_per,
+                on_progress=self.on_progress
+            )
+
+            results = extractor.extract_parallel(archives, temp_dir, password)
+
+            # Log failures
+            for r in results:
+                if not r.success:
+                    logger.warning(f"Failed to extract {r.archive.name}: {r.message}")
+
+            # Success if at least one archive extracted
+            any_success = any(r.success for r in results)
+            return temp_dir, any_success
+
+        else:
+            # Sequential fallback for single archive or no 7z
+            for archive in archives:
+                self._report_progress(f"Extracting: {archive.name}", 50)
+                success, _, msg = self.extract_archive(archive, password, temp_dir)
+                if not success:
+                    logger.warning(f"Failed to extract {archive.name}: {msg}")
+
+            return temp_dir, True
+
+    def _is_potentially_nested(self, archives: List[Path]) -> bool:
+        """
+        Check if archives might contain nested archives (ZIP→RAR scenario).
+
+        Returns True if we should use temp extraction to handle nesting.
+        """
+        # ZIPs often contain nested RAR parts that need combining
+        has_zips = any(a.suffix.lower() == '.zip' for a in archives)
+
+        # Multiple archives could have cross-archive dependencies
+        multiple = len(archives) > 3
+
+        return has_zips or multiple
+
+    def _extract_direct_to_destination(
+        self,
+        archives: List[Path],
+        dest_dir: Path,
+        password: Optional[str] = None
+    ) -> Tuple[bool, int, str]:
+        """
+        Extract archives directly to destination directory (no temp, no move).
+
+        This is the optimized path when:
+        - Download and extract dirs are on different drives
+        - Archives are simple (no nesting expected)
+
+        Args:
+            archives: List of archive files
+            dest_dir: Final destination directory
+            password: Optional archive password
+
+        Returns:
+            (success, files_count, message)
+        """
+        total_files = 0
+        failed_archives = []
+
+        # Use parallel extraction if multiple archives
+        if len(archives) > 1 and self.sevenzip_path:
+            max_par, threads_per = ParallelExtractor.calculate_optimal_params()
+            max_par = min(max_par, len(archives))
+
+            extractor = ParallelExtractor(
+                sevenzip_path=self.sevenzip_path,
+                max_parallel=max_par,
+                threads_per_extraction=threads_per,
+                on_progress=self.on_progress
+            )
+
+            results = extractor.extract_parallel(archives, dest_dir, password)
+
+            for r in results:
+                if r.success:
+                    total_files += r.files_extracted
+                else:
+                    failed_archives.append(r.archive.name)
+                    logger.warning(f"Direct extraction failed: {r.archive.name}: {r.message}")
+
+        else:
+            # Sequential extraction for single archive
+            for i, archive in enumerate(archives):
+                progress = 30 + (60 * i / max(1, len(archives)))
+                self._report_progress(f"Extracting: {archive.name}", progress)
+
+                success, count, msg = self.extract_archive(archive, password, dest_dir)
+                if success:
+                    total_files += count
+                else:
+                    failed_archives.append(archive.name)
+                    logger.warning(f"Direct extraction failed: {archive.name}: {msg}")
+
+        if total_files > 0:
+            logger.info(f"Direct extraction complete: {total_files} files to {dest_dir}")
+            return True, total_files, f"Extracted {total_files} files directly"
+        elif failed_archives:
+            return False, 0, f"All extractions failed: {', '.join(failed_archives)}"
+        else:
+            return True, 0, "No files extracted"
 
     def smart_extract(
         self,
@@ -701,10 +1653,10 @@ class PostProcessor:
         Smart extraction handling nested archives (ZIP→RAR→content).
 
         Strategy:
-        1. Extract ALL outer archives to single temp folder
-        2. Find nested archives (RAR parts now combined)
-        3. Extract nested to final destination subfolder
-        4. Cleanup
+        - FAST PATH: If archives are simple (RAR/7z only) and destination is on
+          different drive, extract DIRECTLY to destination (no temp, no move)
+        - NESTED PATH: If archives might contain nested content (ZIPs), use temp
+          extraction to handle ZIP→RAR scenarios
 
         Args:
             archives: List of archive files
@@ -721,9 +1673,22 @@ class PostProcessor:
         dest_subfolder = self.extract_dir / (release_name or "extracted")
         dest_subfolder.mkdir(parents=True, exist_ok=True)
 
+        # OPTIMIZATION: Check if we can extract directly to destination
+        # This avoids temp extraction + move when destination is on different drive
+        different_drives = not are_on_same_drive(self.download_dir, self.extract_dir)
+        potentially_nested = self._is_potentially_nested(archives)
+
+        # FAST PATH: Direct extraction to destination (no temp, no move)
+        if different_drives and not potentially_nested:
+            logger.info(f"FAST PATH: Direct extraction to {dest_subfolder} (different drives, no nesting)")
+            self._report_progress(f"Direct extraction ({len(archives)} archives)...", 30)
+
+            return self._extract_direct_to_destination(archives, dest_subfolder, password)
+
+        # NESTED PATH: Use temp extraction for complex scenarios
         try:
             # Phase 1: Extract all outer archives to combined temp
-            logger.info(f"Phase 1: Extracting {len(archives)} archives to temp...")
+            logger.info(f"NESTED PATH: Extracting {len(archives)} archives to temp...")
             self._report_progress(f"Extracting {len(archives)} archives...", 30)
 
             temp_dir, _ = self.extract_all_to_temp(archives, password)
@@ -760,51 +1725,74 @@ class PostProcessor:
                     return False, 0, "No files extracted from nested archives"
 
             else:
-                # No nested archives - move temp content to destination
+                # No nested archives - move temp content to destination using batch move
                 logger.info("No nested archives found, moving content directly...")
-                self._report_progress("Moving files...", 80)
+                self._report_progress("Collecting files to move...", 80)
 
-                files_moved = 0
+                # Collect all files to move
+                file_pairs: List[Tuple[Path, Path]] = []
+                used_targets: Set[Path] = set()
+
                 for item in temp_dir.iterdir():
                     # Skip archive files themselves if they ended up in temp
                     if self._is_archive(item):
                         continue
 
-                    target = dest_subfolder / item.name
-
-                    # Handle conflicts
-                    if target.exists():
-                        if item.is_file():
-                            base, ext = target.stem, target.suffix
-                            counter = 1
-                            while target.exists():
-                                target = dest_subfolder / f"{base}_{counter}{ext}"
-                                counter += 1
-
-                    # Use robust move with retry for antivirus locks
                     if item.is_dir():
-                        # Move all files in directory
+                        # Collect all files in directory
+                        base_target = dest_subfolder / item.name
                         for sub in item.rglob('*'):
                             if sub.is_file():
                                 rel = sub.relative_to(item)
-                                sub_target = target / rel
-                                move_result = robust_move_file(sub, sub_target)
-                                if move_result.success or move_result.copied:
-                                    files_moved += 1
-                                if move_result.av_blocked:
-                                    self._av_blocked_files.add(sub.name)
-                        # Cleanup empty source dir
-                        shutil.rmtree(str(item), ignore_errors=True)
+                                sub_target = base_target / rel
+                                # Handle conflicts
+                                if sub_target in used_targets or sub_target.exists():
+                                    base, ext = sub_target.stem, sub_target.suffix
+                                    counter = 1
+                                    while sub_target in used_targets or sub_target.exists():
+                                        sub_target = sub_target.parent / f"{base}_{counter}{ext}"
+                                        counter += 1
+                                sub_target.parent.mkdir(parents=True, exist_ok=True)
+                                file_pairs.append((sub, sub_target))
+                                used_targets.add(sub_target)
                     else:
-                        move_result = robust_move_file(item, target)
-                        if move_result.success or move_result.copied:
-                            files_moved += 1
-                        if move_result.av_blocked:
-                            self._av_blocked_files.add(item.name)
+                        target = dest_subfolder / item.name
+                        # Handle conflicts
+                        if target in used_targets or target.exists():
+                            base, ext = target.stem, target.suffix
+                            counter = 1
+                            while target in used_targets or target.exists():
+                                target = dest_subfolder / f"{base}_{counter}{ext}"
+                                counter += 1
+                        file_pairs.append((item, target))
+                        used_targets.add(target)
 
-                # Cleanup temp
+                if not file_pairs:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    return True, 0, "No files to move"
+
+                # Batch move with progress
+                def move_progress(done: int, total: int) -> None:
+                    pct = 80 + (15 * done / max(1, total))
+                    self._report_progress(f"Moving files: {done}/{total}", pct)
+
+                batch_result = batch_move_files(
+                    file_pairs,
+                    max_workers=min(12, os.cpu_count() or 8),
+                    on_progress=move_progress
+                )
+
+                # Track AV-blocked files
+                for i, r in enumerate(batch_result.results):
+                    if r.av_blocked:
+                        src_file = file_pairs[i][0] if i < len(file_pairs) else None
+                        if src_file:
+                            self._av_blocked_files.add(src_file.name)
+
+                # Cleanup temp directory
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
+                files_moved = batch_result.successful
                 logger.info(f"Direct extract complete: {files_moved} files to {dest_subfolder}")
                 return True, files_moved, f"Moved {files_moved} files"
 
@@ -818,13 +1806,14 @@ class PostProcessor:
         self,
         nzb_path: Optional[Path] = None,
         source_dir: Optional[Path] = None,
-        password: Optional[str] = None
+        password: Optional[str] = None,
+        early_par2_result: Optional[Tuple[bool, bool, str]] = None
     ) -> PostProcessResult:
         """
         Full post-processing pipeline.
 
         1. Parse NZB for password (if provided)
-        2. Find and verify PAR2 files
+        2. Find and verify PAR2 files (or use early result from streaming PAR2)
         3. Find and extract archives
         4. Optional cleanup
 
@@ -832,6 +1821,7 @@ class PostProcessor:
             nzb_path: Path to NZB file (for password extraction)
             source_dir: Directory containing downloaded files (default: download_dir)
             password: Override password (if not from NZB)
+            early_par2_result: Optional (verified, repaired, message) from streaming PAR2
 
         Returns:
             PostProcessResult with details
@@ -856,9 +1846,42 @@ class PostProcessor:
                     password = metadata.password
                     logger.info(f"Using password from NZB: ***")
 
-            # Step 2: PAR2 verification
+            # Step 2: PAR2 verification (use early result if available)
             par2_files = self.find_par2_files(src_dir)
-            if par2_files:
+
+            if early_par2_result:
+                # Use streaming PAR2 result - skip re-verification
+                verified, repaired, msg = early_par2_result
+                logger.info(f"Using early PAR2 result: verified={verified}, repaired={repaired}")
+
+                if verified:
+                    result.par2_verified = True
+                    result.par2_repaired = repaired
+                    self._report_progress(f"PAR2 (early): {msg}", 40)
+                else:
+                    # Early verification failed - try repair
+                    if par2_files and self.par2_path:
+                        logger.info("Early PAR2 failed, attempting repair...")
+                        self._report_progress("PAR2 repair needed...", 10)
+                        verified, repaired, msg = self.verify_par2(par2_files[0], repair=True)
+                        result.par2_verified = verified
+                        result.par2_repaired = repaired
+
+                        if not verified:
+                            result.status = PostProcessStatus.FAILED
+                            result.message = f"PAR2 repair failed: {msg}"
+                            result.errors.append(msg)
+                            return result
+
+                        self._report_progress(f"PAR2: {msg}", 40)
+                    else:
+                        result.status = PostProcessStatus.FAILED
+                        result.message = f"PAR2 verification failed: {msg}"
+                        result.errors.append(msg)
+                        return result
+
+            elif par2_files:
+                # No early result - run full verification
                 self._report_progress("Starting PAR2 verification...", 10)
                 main_par2 = par2_files[0]  # Main par2 file
 
@@ -894,15 +1917,35 @@ class PostProcessor:
                 logger.info(f"Smart extracting {len(archives)} archives → {release_name}/")
                 self._report_progress(f"Smart extracting {len(archives)} archives...", 50)
 
+                # Track extraction time for metrics
+                extraction_start = time.time()
+
                 # Use smart_extract: extracts ALL to temp, finds nested RARs, extracts to subfolder
                 success, total_files, msg = self.smart_extract(
                     archives, password, release_name
                 )
 
+                result.extraction_duration_seconds = time.time() - extraction_start
+
                 if success:
                     result.files_extracted = total_files
                     result.extract_path = self.extract_dir / release_name
                     self._report_progress(f"Extracted {total_files} files", 90)
+
+                    # Calculate extracted bytes for metrics
+                    try:
+                        result.extracted_bytes = sum(
+                            f.stat().st_size for f in result.extract_path.rglob('*') if f.is_file()
+                        )
+                    except Exception:
+                        pass
+
+                    # Copy NFO files if not already in extracted content
+                    # Pass NZB filenames to only copy NFOs from this specific download
+                    nzb_filenames = set(metadata.filenames) if metadata.filenames else None
+                    nfo_copied = self._copy_nfo_files(src_dir, result.extract_path, nzb_filenames)
+                    if nfo_copied > 0:
+                        result.files_extracted += nfo_copied
                 else:
                     result.errors.append(msg)
                     if total_files == 0:
@@ -918,10 +1961,19 @@ class PostProcessor:
                     result.extract_path = self.extract_dir / metadata.title if metadata.title else self.extract_dir
                     logger.info(f"Moved {moved_files} media file(s) to destination")
 
-            # Step 4: Cleanup (optional)
+            # Step 4: Cleanup (optional) - ONLY files from this NZB
             if self.cleanup_after_extract and result.files_extracted > 0:
-                self._report_progress("Cleaning up...", 95)
-                self.cleanup_archives(src_dir)
+                if metadata.filenames:
+                    self._report_progress("Cleaning up...", 95)
+                    nzb_filenames = set(metadata.filenames)
+                    self.cleanup_archives(src_dir, nzb_filenames)
+                else:
+                    # No NZB filenames extracted - skip cleanup for safety
+                    logger.warning("Skipping cleanup: could not extract filenames from NZB (manual cleanup required)")
+                    result.warnings.append((
+                        WarningType.CLEANUP_SKIPPED,
+                        "Cleanup skipped - manual cleanup required"
+                    ))
 
             # Success!
             result.success = True
