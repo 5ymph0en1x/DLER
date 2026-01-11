@@ -12,7 +12,7 @@ import threading
 import time
 import logging
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple
 from dataclasses import dataclass
 
 import tkinter as tk
@@ -573,6 +573,8 @@ class DLERApp:
 
     def _download_thread(self, nzb_path: Path) -> None:
         """Background download."""
+        streaming_pp = None  # Streaming post-processor for early PAR2
+
         try:
             if self._turbo_engine is None:
                 self._init_engine()
@@ -581,6 +583,29 @@ class DLERApp:
                 self._queue_info_var.set("Failed to initialize")
                 self._state.is_downloading = False
                 return
+
+            # === STREAMING PAR2: Setup early verification ===
+            if (self._config and
+                self._config.postprocess.enabled and
+                self._config.postprocess.streaming_par2):
+                try:
+                    from ..core.post_processor import StreamingPostProcessor
+
+                    download_dir = Path(self._config.download.output_dir)
+                    streaming_pp = StreamingPostProcessor(
+                        download_dir=download_dir,
+                        par2_path=self._config.postprocess.par2_path or None,
+                        on_early_issue=lambda msg: self._queue_info_var.set(f"PAR2: {msg[:25]}..."),
+                        on_progress=lambda msg, _: logger.debug(f"Streaming PAR2: {msg}")
+                    )
+
+                    # Register callback with engine
+                    self._turbo_engine.on_file_complete = streaming_pp.on_file_complete
+                    logger.info("Streaming PAR2 enabled - will verify during download")
+
+                except Exception as e:
+                    logger.warning(f"Streaming PAR2 setup failed: {e}")
+                    streaming_pp = None
 
             self._parse_nzb_size(nzb_path)
             self._queue_info_var.set(f"Downloading...")
@@ -623,8 +648,23 @@ class DLERApp:
                     logger.info(f"Postprocess enabled: {self._config.postprocess.enabled}")
 
                 if self._config and self._config.postprocess.enabled:
+                    # Get early PAR2 result from streaming verification if available
+                    early_par2_result = None
+                    if streaming_pp:
+                        # Wait briefly for early PAR2 to finish if it's running
+                        streaming_pp.wait_for_par2(timeout=5)
+                        early_par2_result = streaming_pp.get_early_result()
+                        if early_par2_result:
+                            verified, _, msg = early_par2_result
+                            logger.info(f"Early PAR2 result available: verified={verified}, {msg}")
+
                     logger.info("Starting post-processing...")
-                    self._run_post_processing(nzb_path)
+                    self._run_post_processing(
+                        nzb_path,
+                        early_par2_result=early_par2_result,
+                        download_size=self._state.downloaded_bytes,
+                        download_duration=elapsed
+                    )
                     logger.info("Post-processing finished")
                 else:
                     logger.info("Post-processing disabled or no config")
@@ -651,8 +691,22 @@ class DLERApp:
             self._update_queue_info()
             self._master.after(500, self._start_next_download)
 
-    def _run_post_processing(self, nzb_path: Path) -> None:
-        """Run PAR2 verification and extraction."""
+    def _run_post_processing(
+        self,
+        nzb_path: Path,
+        early_par2_result: Optional[Tuple[bool, bool, str]] = None,
+        download_size: int = 0,
+        download_duration: float = 0.0
+    ) -> None:
+        """
+        Run PAR2 verification and extraction.
+
+        Args:
+            nzb_path: Path to NZB file
+            early_par2_result: Optional (verified, repaired, message) from streaming PAR2
+            download_size: Total bytes downloaded
+            download_duration: Download time in seconds
+        """
         logger.info(f"=== _run_post_processing called for {nzb_path.name} ===")
         try:
             from ..core.post_processor import PostProcessor
@@ -672,6 +726,8 @@ class DLERApp:
             logger.info(f"Extract dir: {extract_dir}")
             logger.info(f"PAR2 path: {self._config.postprocess.par2_path or 'auto-detect'}")
             logger.info(f"7z path: {self._config.postprocess.sevenzip_path or 'auto-detect'}")
+            if early_par2_result:
+                logger.info(f"Early PAR2 result: {early_par2_result}")
 
             processor = PostProcessor(
                 download_dir=download_dir,
@@ -685,19 +741,20 @@ class DLERApp:
             logger.info(f"PostProcessor created. PAR2={processor.par2_path}, 7z={processor.sevenzip_path}")
             logger.info("Calling processor.process()...")
 
-            result = processor.process(nzb_path)
+            # Pass early PAR2 result to skip re-verification if already done
+            result = processor.process(nzb_path, early_par2_result=early_par2_result)
             logger.info(f"processor.process() returned: success={result.success}, msg={result.message}")
 
             if result.success:
+                # Build concise status message
                 msg = f"Done! {result.files_extracted} files"
                 if result.par2_repaired:
                     msg += " (repaired)"
                 self._queue_info_var.set(msg)
                 logger.info(f"Post-processing completed: {result.message}")
 
-                # Show warnings to user if any
-                if result.warnings:
-                    self._show_post_process_warnings(result)
+                # Show single completion summary with all metrics
+                self._show_completion_summary(result, download_size, download_duration)
             else:
                 self._queue_info_var.set(f"PP Error: {result.message[:30]}")
                 logger.error(f"Post-processing failed: {result.message}")
@@ -893,6 +950,89 @@ class DLERApp:
                 "Post-Processing Warnings",
                 full_message
             ))
+
+    def _show_completion_summary(
+        self,
+        result,
+        download_size: int,
+        download_duration: float
+    ) -> None:
+        """Show detailed completion summary with metrics."""
+
+        def format_size(bytes_val: int) -> str:
+            if bytes_val >= 1024**3:
+                return f"{bytes_val / (1024**3):.2f} GB"
+            elif bytes_val >= 1024**2:
+                return f"{bytes_val / (1024**2):.1f} MB"
+            return f"{bytes_val / 1024:.0f} KB"
+
+        def format_duration(seconds: float) -> str:
+            if seconds >= 3600:
+                h, m = divmod(int(seconds), 3600)
+                m, s = divmod(m, 60)
+                return f"{h}h {m}m {s}s"
+            elif seconds >= 60:
+                m, s = divmod(int(seconds), 60)
+                return f"{m}m {s}s"
+            return f"{seconds:.1f}s"
+
+        lines = []
+
+        # Title based on success/repair status
+        if result.par2_repaired:
+            title = "Download Complete (Repaired)"
+        else:
+            title = "Download Complete"
+
+        # Files extracted
+        lines.append(f"Files extracted: {result.files_extracted}")
+
+        # Destination
+        if result.extract_path:
+            lines.append(f"Destination: {result.extract_path}")
+
+        lines.append("")  # Separator
+
+        # === DOWNLOAD METRICS ===
+        if download_size > 0 and download_duration > 0:
+            dl_speed = download_size / (download_duration * 1024 * 1024)
+            lines.append(f"Download: {format_size(download_size)} in {format_duration(download_duration)}")
+            lines.append(f"Network speed: {dl_speed:.1f} MB/s avg")
+
+        # === EXTRACTION METRICS ===
+        if result.extraction_duration_seconds > 0 and result.extracted_bytes > 0:
+            lines.append("")
+            lines.append(f"Extraction: {format_size(result.extracted_bytes)} in {format_duration(result.extraction_duration_seconds)}")
+            lines.append(f"Disk throughput: {result.extraction_speed_mbs:.1f} MB/s")
+
+        # === REPAIR INFO (only if repair actually happened) ===
+        if result.par2_repaired:
+            lines.append("")
+            lines.append("PAR2 repair was required and successful.")
+
+        # === TOTAL TIME ===
+        if result.duration_seconds > 0:
+            lines.append("")
+            lines.append(f"Total post-processing: {format_duration(result.duration_seconds)}")
+
+        # === WARNINGS (only critical ones) ===
+        if result.warnings:
+            from ..core.post_processor import WarningType
+            critical_warnings = []
+            for warning_type, warning_msg in result.warnings:
+                if warning_type == WarningType.ANTIVIRUS_BLOCK:
+                    critical_warnings.append(f"Antivirus: {warning_msg}")
+                elif warning_type == WarningType.CLEANUP_SKIPPED:
+                    critical_warnings.append(f"Cleanup: {warning_msg}")
+
+            if critical_warnings:
+                lines.append("")
+                lines.append("ATTENTION:")
+                lines.extend(critical_warnings)
+
+        message = "\n".join(lines)
+
+        self._master.after(100, lambda: messagebox.showinfo(title, message))
 
     def _force_100_percent(self) -> None:
         """Force progress to 100% on main thread."""
