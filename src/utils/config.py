@@ -94,6 +94,11 @@ class PostProcessConfig:
     cleanup_after_extract: bool = True
     par2_path: str = ""  # Empty = auto-detect
     sevenzip_path: str = ""  # Empty = auto-detect
+    # Optimization settings
+    parallel_extraction: bool = True       # Extract multiple archives in parallel
+    max_parallel_extractions: int = 3      # Max concurrent 7z processes
+    streaming_par2: bool = True            # Start PAR2 during download
+    parallel_move_threads: int = 8         # Threads for batch file move
 
 
 @dataclass
@@ -105,7 +110,7 @@ class Config:
     ui: UIConfig = field(default_factory=UIConfig)
     turbo: TurboConfig = field(default_factory=TurboConfig)
     postprocess: PostProcessConfig = field(default_factory=PostProcessConfig)
-    version: str = "1.0.0"
+    version: str = "1.0.2"
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -146,6 +151,13 @@ class Config:
 
         if self.turbo.pipeline_depth < 1 or self.turbo.pipeline_depth > 50:
             errors.append("Pipeline depth must be between 1 and 50")
+
+        # Post-process optimization validation
+        if self.postprocess.max_parallel_extractions < 1 or self.postprocess.max_parallel_extractions > 8:
+            errors.append("Max parallel extractions must be between 1 and 8")
+
+        if self.postprocess.parallel_move_threads < 1 or self.postprocess.parallel_move_threads > 32:
+            errors.append("Parallel move threads must be between 1 and 32")
 
         return errors
 
