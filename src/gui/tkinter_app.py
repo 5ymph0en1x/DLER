@@ -30,12 +30,19 @@ try:
 except ImportError:
     HAS_PIL = False
 
+try:
+    from .speed_graph import SpeedGraphWidget
+    HAS_SPEED_GRAPH = True
+except ImportError:
+    HAS_SPEED_GRAPH = False
+
 logger = logging.getLogger(__name__)
 
 # Fixed dimensions for consistent layout
 SPEED_PANEL_WIDTH = 200
 SPEED_PANEL_HEIGHT = 150
 PROGRESS_PANEL_HEIGHT = 150
+GRAPH_PANEL_HEIGHT = 95
 STATS_PANEL_HEIGHT = 85
 QUEUE_PANEL_HEIGHT = 120
 
@@ -95,6 +102,7 @@ class DownloadState:
     queue_raw: int = 0
     queue_write: int = 0
     is_downloading: bool = False
+    is_post_processing: bool = False
     status_message: str = "Ready"
 
 
@@ -111,6 +119,7 @@ class DLERApp:
         self._icon_image = None
         self._is_paused = False
         self._download_complete = False  # Prevents progress updates after completion
+        self._speed_graph = None  # Speed graph widget
 
         self._setup_ui()
         self._load_config()
@@ -131,8 +140,8 @@ class DLERApp:
             self._root.title("DLER")
             self._master = self._root
 
-        self._master.geometry("720x600")
-        self._master.minsize(700, 580)
+        self._master.geometry("720x710")
+        self._master.minsize(700, 690)
         self._master.resizable(True, True)
 
         # Set window icon (taskbar icon)
@@ -145,11 +154,12 @@ class DLERApp:
         # Fixed grid weights
         main_container.columnconfigure(0, weight=0, minsize=SPEED_PANEL_WIDTH)
         main_container.columnconfigure(1, weight=1)
-        main_container.rowconfigure(3, weight=1)
+        main_container.rowconfigure(4, weight=1)  # Queue panel expands
 
         self._create_header(main_container)
         self._create_speed_panel(main_container)
         self._create_progress_panel(main_container)
+        self._create_speed_graph_panel(main_container)  # NEW: Speed graph
         self._create_stats_panel(main_container)
         self._create_queue_panel(main_container)
         self._create_action_bar(main_container)
@@ -351,11 +361,41 @@ class DLERApp:
             anchor="e"
         ).pack(side="right")
 
+    def _create_speed_graph_panel(self, parent) -> None:
+        """Create speed graph panel with Windows 11-style animated chart."""
+        if not HAS_SPEED_GRAPH:
+            logger.warning("SpeedGraphWidget not available")
+            return
+
+        # Outer frame with fixed height
+        graph_outer = ttk.Frame(parent, height=GRAPH_PANEL_HEIGHT)
+        graph_outer.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        graph_outer.grid_propagate(False)  # FIXED HEIGHT
+
+        # LabelFrame inside
+        graph_frame = ttk.LabelFrame(graph_outer, text=" SPEED HISTORY ", padding=4)
+        graph_frame.pack(fill="both", expand=True)
+        graph_frame.columnconfigure(0, weight=1)
+        graph_frame.rowconfigure(0, weight=1)
+
+        # Create the speed graph widget
+        self._speed_graph = SpeedGraphWidget(
+            graph_frame,
+            width=650,
+            height=70,
+            max_samples=60,  # 60 seconds of history
+            update_interval_ms=100
+        )
+        self._speed_graph.pack(fill="both", expand=True, padx=1, pady=1)
+
+        # Start animation
+        self._speed_graph.start_animation()
+
     def _create_stats_panel(self, parent) -> None:
         """Create statistics panel with elegant subframes."""
         # Outer frame
         stats_outer = ttk.Frame(parent, height=STATS_PANEL_HEIGHT)
-        stats_outer.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        stats_outer.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 12))
         stats_outer.grid_propagate(False)  # FIXED HEIGHT
 
         # Main container for 3 metric boxes
@@ -403,7 +443,7 @@ class DLERApp:
         """Create fixed-size queue panel."""
         # Outer frame
         queue_outer = ttk.Frame(parent)
-        queue_outer.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(0, 12))
+        queue_outer.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=(0, 12))
         queue_outer.columnconfigure(0, weight=1)
         queue_outer.rowconfigure(0, weight=1)
 
@@ -454,7 +494,7 @@ class DLERApp:
     def _create_action_bar(self, parent) -> None:
         """Create action buttons."""
         action_frame = ttk.Frame(parent)
-        action_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        action_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(5, 0))
         action_frame.columnconfigure(1, weight=1)
 
         # Add NZB
@@ -562,6 +602,10 @@ class DLERApp:
         self._state.progress_percent = 0  # Reset progress
         self._stop_btn.config(state="normal")
         self._pause_btn.config(state="normal")
+
+        # Reset speed graph for new download
+        if self._speed_graph:
+            self._speed_graph.reset()
 
         if self._queue_listbox.size() > 0:
             self._queue_listbox.delete(0)
@@ -720,7 +764,26 @@ class DLERApp:
             extract_dir = Path(self._config.postprocess.extract_dir)
 
             def progress_callback(msg: str, percent: float):
-                self._queue_info_var.set(f"PP: {msg}")
+                # Schedule ALL updates on main thread (Tkinter is not thread-safe)
+                def update_ui():
+                    self._queue_info_var.set(f"PP: {msg}")
+                    if percent >= 0:
+                        self._state.progress_percent = percent
+                        self._progress_var.set(percent)
+                        self._percent_var.set(f"{percent:5.1f}%")
+                self._master.after(0, update_ui)
+                logger.debug(f"PP Progress: {msg} ({percent}%)")
+
+            # Enter post-processing mode - prevents _update_ui from overwriting progress
+            self._state.is_post_processing = True
+
+            # Reset progress bar for post-processing (on main thread)
+            def init_pp_ui():
+                self._state.progress_percent = 0
+                self._progress_var.set(0)
+                self._percent_var.set("  0.0%")
+                self._queue_info_var.set("PP: Starting...")
+            self._master.after(0, init_pp_ui)
 
             logger.info(f"Download dir: {download_dir}")
             logger.info(f"Extract dir: {extract_dir}")
@@ -770,6 +833,9 @@ class DLERApp:
         except Exception as e:
             logger.error(f"Post-processing error: {e}")
             self._queue_info_var.set(f"PP Error: {str(e)[:30]}")
+        finally:
+            # Exit post-processing mode
+            self._state.is_post_processing = False
 
     def _init_engine(self) -> None:
         """Initialize TurboEngineV2."""
@@ -900,6 +966,9 @@ class DLERApp:
                 self._turbo_engine.pause()
             self._is_paused = True
             self._state.speed_mbps = 0  # Reset speed display
+            # Update graph to show zero speed when paused
+            if self._speed_graph:
+                self._speed_graph.update_speed(0.0)
             self._pause_btn.config(text="Resume")
             self._queue_info_var.set("Paused")
 
@@ -920,6 +989,10 @@ class DLERApp:
         self._state.eta_seconds = 0
         self._state.current_file = ""
         self._is_paused = False
+
+        # Update graph to show zero speed
+        if self._speed_graph:
+            self._speed_graph.update_speed(0.0)
 
         self._download_queue.clear()
         self._queue_listbox.delete(0, "end")
@@ -1040,6 +1113,12 @@ class DLERApp:
         self._progress_var.set(100.0)
         self._percent_var.set("100.0%")
 
+    def _update_pp_progress(self, percent: float) -> None:
+        """Update progress bar during post-processing."""
+        self._state.progress_percent = percent
+        self._progress_var.set(percent)
+        self._percent_var.set(f"{percent:5.1f}%")
+
     def _schedule_update(self) -> None:
         """Schedule UI update."""
         self._update_ui()
@@ -1052,9 +1131,14 @@ class DLERApp:
         self._speed_var.set(speed_val)
         self._speed_unit_var.set(speed_unit)
 
-        # Progress
-        self._progress_var.set(self._state.progress_percent)
-        self._percent_var.set(f"{self._state.progress_percent:5.1f}%")
+        # Update speed graph
+        if self._speed_graph and self._state.is_downloading:
+            self._speed_graph.update_speed(self._state.speed_mbps)
+
+        # Progress (skip update during post-processing to let PP control it)
+        if not self._state.is_post_processing:
+            self._progress_var.set(self._state.progress_percent)
+            self._percent_var.set(f"{self._state.progress_percent:5.1f}%")
 
         # File name (truncate to fixed width)
         if self._state.is_downloading and self._state.current_file:
