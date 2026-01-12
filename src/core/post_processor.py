@@ -101,6 +101,65 @@ def _normalize_filename(filename: str) -> str:
     return normalized
 
 
+def quick_nzb_analysis(nzb_path: Path) -> Tuple[str, bool]:
+    """
+    Quickly analyze NZB to determine title and if it contains archives.
+
+    This is a lightweight function for deciding download destination
+    BEFORE starting the download.
+
+    Args:
+        nzb_path: Path to NZB file
+
+    Returns:
+        (title, has_archives) tuple
+    """
+    title = nzb_path.stem
+    has_archives = False
+    archive_patterns = {'.rar', '.zip', '.7z', '.tar', '.gz'}
+
+    try:
+        tree = ET.parse(nzb_path)
+        root = tree.getroot()
+        ns = {'nzb': 'http://www.newzbin.com/DTD/2003/nzb'}
+
+        # Get title from metadata
+        for meta in root.findall('.//nzb:meta', ns):
+            if meta.get('type', '').lower() == 'name' and meta.text:
+                title = meta.text.strip()
+                break
+        else:
+            for meta in root.findall('.//meta'):
+                if meta.get('type', '').lower() == 'name' and meta.text:
+                    title = meta.text.strip()
+                    break
+
+        # Check file subjects for archive extensions
+        file_elements = root.findall('.//nzb:file', ns) or root.findall('.//file')
+
+        for file_elem in file_elements:
+            subject = file_elem.get('subject', '').lower()
+            # Check for archive extensions in subject
+            if any(ext in subject for ext in archive_patterns):
+                has_archives = True
+                break
+            # Check for RAR split pattern
+            if re.search(r'\.r\d{2}', subject):
+                has_archives = True
+                break
+            if '.part' in subject and '.rar' in subject:
+                has_archives = True
+                break
+
+        logger.debug(f"Quick NZB analysis: title={title}, has_archives={has_archives}")
+
+    except Exception as e:
+        logger.warning(f"Quick NZB analysis failed: {e}, assuming has_archives=True")
+        has_archives = True  # Safe default: use temp dir
+
+    return title, has_archives
+
+
 class PostProcessStatus(Enum):
     """Post-processing status."""
     PENDING = "pending"
@@ -157,6 +216,7 @@ class NZBMetadata:
     category: str = ""
     group: str = ""
     filenames: List[str] = field(default_factory=list)  # List of files in NZB
+    has_archives: bool = False  # True if NZB contains RAR/ZIP/7z archives
 
 
 class MoveResult:
@@ -1112,7 +1172,24 @@ class PostProcessor:
                     elif subject:
                         logger.debug(f"Could not extract filename from subject: {subject[:80]}...")
 
-            logger.info(f"NZB Metadata: title={metadata.title}, password={'***' if metadata.password else 'None'}, files={len(metadata.filenames)}")
+            # Detect if NZB contains archive files
+            archive_extensions = {'.rar', '.zip', '.7z', '.tar', '.gz'}
+            for fname in metadata.filenames:
+                fname_lower = fname.lower()
+                # Check extension
+                if any(fname_lower.endswith(ext) for ext in archive_extensions):
+                    metadata.has_archives = True
+                    break
+                # Check for RAR split parts (.r00, .r01, etc.)
+                if re.search(r'\.r\d{2,}$', fname_lower):
+                    metadata.has_archives = True
+                    break
+                # Check for .partXX.rar pattern
+                if '.part' in fname_lower and '.rar' in fname_lower:
+                    metadata.has_archives = True
+                    break
+
+            logger.info(f"NZB Metadata: title={metadata.title}, password={'***' if metadata.password else 'None'}, files={len(metadata.filenames)}, has_archives={metadata.has_archives}")
 
             # Debug: show first few filenames extracted
             if metadata.filenames:
@@ -2026,7 +2103,8 @@ class PostProcessor:
         nzb_path: Optional[Path] = None,
         source_dir: Optional[Path] = None,
         password: Optional[str] = None,
-        early_par2_result: Optional[Tuple[bool, bool, str]] = None
+        early_par2_result: Optional[Tuple[bool, bool, str]] = None,
+        direct_to_destination: bool = False
     ) -> PostProcessResult:
         """
         Full post-processing pipeline.
@@ -2041,6 +2119,7 @@ class PostProcessor:
             source_dir: Directory containing downloaded files (default: download_dir)
             password: Override password (if not from NZB)
             early_par2_result: Optional (verified, repaired, message) from streaming PAR2
+            direct_to_destination: If True, files are already at final destination (skip move)
 
         Returns:
             PostProcessResult with details
@@ -2172,13 +2251,23 @@ class PostProcessor:
                         result.message = f"Extraction failed: {msg}"
                         return result
             else:
-                # No archives - check for media files to move (MKV, AVI, MP4, etc.)
+                # No archives - check for media files
                 logger.info("No archives found, checking for media files...")
-                moved_files = self._move_media_files(src_dir, metadata.title)
-                if moved_files > 0:
-                    result.files_extracted = moved_files
-                    result.extract_path = self.extract_dir / metadata.title if metadata.title else self.extract_dir
-                    logger.info(f"Moved {moved_files} media file(s) to destination")
+
+                if direct_to_destination:
+                    # Files already at final destination - just count them
+                    media_files = [f for f in src_dir.iterdir()
+                                   if f.is_file() and self._is_media_file(f)]
+                    result.files_extracted = len(media_files)
+                    result.extract_path = src_dir  # Already at destination
+                    logger.info(f"DIRECT-TO-DESTINATION: {len(media_files)} media file(s) already at {src_dir}")
+                else:
+                    # Normal flow: move media files to destination
+                    moved_files = self._move_media_files(src_dir, metadata.title)
+                    if moved_files > 0:
+                        result.files_extracted = moved_files
+                        result.extract_path = self.extract_dir / metadata.title if metadata.title else self.extract_dir
+                        logger.info(f"Moved {moved_files} media file(s) to destination")
 
             # Step 4: Cleanup (optional) - ONLY files from this NZB
             if self.cleanup_after_extract and result.files_extracted > 0:
