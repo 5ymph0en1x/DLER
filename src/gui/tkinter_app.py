@@ -378,12 +378,11 @@ class DLERApp:
         graph_frame.columnconfigure(0, weight=1)
         graph_frame.rowconfigure(0, weight=1)
 
-        # Create the speed graph widget
+        # Create the speed graph widget (keeps all data, compresses to fit)
         self._speed_graph = SpeedGraphWidget(
             graph_frame,
             width=650,
             height=70,
-            max_samples=60,  # 60 seconds of history
             update_interval_ms=100
         )
         self._speed_graph.pack(fill="both", expand=True, padx=1, pady=1)
@@ -447,36 +446,44 @@ class DLERApp:
         queue_outer.columnconfigure(0, weight=1)
         queue_outer.rowconfigure(0, weight=1)
 
-        # LabelFrame inside
-        queue_frame = ttk.LabelFrame(queue_outer, text=" QUEUE ", padding=10)
-        queue_frame.pack(fill="both", expand=True)
-        queue_frame.columnconfigure(0, weight=1)
-        queue_frame.rowconfigure(0, weight=1)
+        # LabelFrame for logs
+        log_frame = ttk.LabelFrame(queue_outer, text=" LOGS ", padding=10)
+        log_frame.pack(fill="both", expand=True)
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
 
-        # Listbox with fixed font
-        list_frame = ttk.Frame(queue_frame)
+        # Text widget for logs (read-only)
+        list_frame = ttk.Frame(log_frame)
         list_frame.grid(row=0, column=0, sticky="nsew")
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
 
-        self._queue_listbox = tk.Listbox(
+        self._log_text = tk.Text(
             list_frame,
             height=4,
             font=FONT_VALUE_SMALL,
-            selectmode="single",
-            activestyle="none"
+            wrap="none",
+            state="disabled",
+            cursor="arrow"
         )
-        self._queue_listbox.grid(row=0, column=0, sticky="nsew")
+        self._log_text.grid(row=0, column=0, sticky="nsew")
 
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self._queue_listbox.yview)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self._log_text.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
-        self._queue_listbox.configure(yscrollcommand=scrollbar.set)
+        self._log_text.configure(yscrollcommand=scrollbar.set)
+
+        # Configure log text tags for colors
+        self._log_text.tag_configure("time", foreground="#666666")
+        self._log_text.tag_configure("info", foreground="#808080")
+        self._log_text.tag_configure("success", foreground="#4CAF50")
+        self._log_text.tag_configure("warning", foreground="#FFA726")
+        self._log_text.tag_configure("error", foreground="#EF5350")
 
         # Status bar
-        status_frame = ttk.Frame(queue_frame)
+        status_frame = ttk.Frame(log_frame)
         status_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
 
-        self._queue_info_var = tk.StringVar(value="Queue empty")
+        self._queue_info_var = tk.StringVar(value="Ready")
         ttk.Label(
             status_frame,
             textvariable=self._queue_info_var,
@@ -490,6 +497,9 @@ class DLERApp:
             textvariable=self._total_var,
             font=FONT_VALUE_SMALL
         ).pack(side="right")
+
+        # Keep reference for compatibility (some code still uses _queue_listbox)
+        self._queue_listbox = None
 
     def _create_action_bar(self, parent) -> None:
         """Create action buttons."""
@@ -540,6 +550,39 @@ class DLERApp:
             logger.warning(f"Could not load config: {e}")
             self._config = None
 
+    def _log(self, message: str, level: str = "info") -> None:
+        """
+        Add a message to the logs panel.
+
+        Args:
+            message: The message to display
+            level: One of 'info', 'success', 'warning', 'error'
+        """
+        from datetime import datetime
+
+        def update():
+            self._log_text.configure(state="normal")
+
+            # Add timestamp
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self._log_text.insert("end", f"{timestamp} ", "time")
+
+            # Add message with appropriate tag
+            self._log_text.insert("end", f"{message}\n", level)
+
+            # Auto-scroll to bottom
+            self._log_text.see("end")
+
+            # Limit to last 100 lines to prevent memory issues
+            lines = int(self._log_text.index('end-1c').split('.')[0])
+            if lines > 100:
+                self._log_text.delete("1.0", f"{lines - 100}.0")
+
+            self._log_text.configure(state="disabled")
+
+        # Schedule on main thread if called from background thread
+        self._master.after(0, update)
+
     def _show_settings(self) -> None:
         """Show settings dialog."""
         SettingsDialog(self._master, self._config, self._on_settings_saved)
@@ -564,7 +607,7 @@ class DLERApp:
         for f in files:
             path = Path(f)
             self._download_queue.append(path)
-            self._queue_listbox.insert("end", f"  {path.name}")
+            self._log(f"Queued: {path.name}", "info")
             logger.info(f"Queued: {path.name}")
 
         self._update_queue_info()
@@ -607,10 +650,8 @@ class DLERApp:
         if self._speed_graph:
             self._speed_graph.reset()
 
-        if self._queue_listbox.size() > 0:
-            self._queue_listbox.delete(0)
-            self._queue_listbox.insert(0, f"> {nzb_path.name}")
-            self._queue_listbox.itemconfig(0, foreground="#4CAF50")
+        # Log download start
+        self._log(f"Starting: {nzb_path.name}", "info")
 
         thread = threading.Thread(target=self._download_thread, args=(nzb_path,), daemon=True)
         thread.start()
@@ -618,6 +659,8 @@ class DLERApp:
     def _download_thread(self, nzb_path: Path) -> None:
         """Background download."""
         streaming_pp = None  # Streaming post-processor for early PAR2
+        direct_to_destination = False  # True if downloading directly to final location
+        release_title = nzb_path.stem
 
         try:
             if self._turbo_engine is None:
@@ -628,6 +671,36 @@ class DLERApp:
                 self._state.is_downloading = False
                 return
 
+            # === DIRECT-TO-DESTINATION: Analyze NZB before download ===
+            # For non-RAR releases, download directly to extract_dir (skip post-move)
+            if (self._config and
+                self._config.postprocess.enabled and
+                self._config.postprocess.extract_dir):
+                try:
+                    from ..core.post_processor import quick_nzb_analysis
+
+                    release_title, has_archives = quick_nzb_analysis(nzb_path)
+
+                    if not has_archives:
+                        # No RAR/ZIP → download directly to final destination
+                        final_dir = Path(self._config.postprocess.extract_dir) / release_title
+                        final_dir.mkdir(parents=True, exist_ok=True)
+
+                        self._turbo_engine.output_dir = final_dir
+                        direct_to_destination = True
+                        logger.info(f"DIRECT-TO-DESTINATION: No archives detected, downloading to {final_dir}")
+                    else:
+                        # Has archives → use temp dir (normal flow)
+                        self._turbo_engine.output_dir = Path(self._config.download.output_dir)
+                        logger.info(f"NORMAL FLOW: Archives detected, downloading to temp dir")
+
+                except Exception as e:
+                    logger.warning(f"NZB analysis failed: {e}, using normal flow")
+                    self._turbo_engine.output_dir = Path(self._config.download.output_dir)
+
+            # Get actual download dir after potential override
+            download_dir = self._turbo_engine.output_dir
+
             # === STREAMING PAR2: Setup early verification ===
             if (self._config and
                 self._config.postprocess.enabled and
@@ -635,7 +708,6 @@ class DLERApp:
                 try:
                     from ..core.post_processor import StreamingPostProcessor
 
-                    download_dir = Path(self._config.download.output_dir)
                     streaming_pp = StreamingPostProcessor(
                         download_dir=download_dir,
                         par2_path=self._config.postprocess.par2_path or None,
@@ -680,10 +752,12 @@ class DLERApp:
                 avg_speed = self._state.downloaded_bytes / (elapsed * 1024 * 1024) if elapsed > 0 else 0
                 self._queue_info_var.set(f"Complete! {avg_speed:.1f} MB/s avg")
 
+                # Log download completion
+                size_gb = self._state.downloaded_bytes / (1024 * 1024 * 1024)
+                self._log(f"Download complete: {size_gb:.2f} GB in {elapsed:.0f}s ({avg_speed:.1f} MB/s)", "success")
+
                 # Force immediate UI update on main thread
                 self._master.after(0, self._force_100_percent)
-                if self._queue_listbox.size() > 0:
-                    self._queue_listbox.delete(0)
 
                 # === POST-PROCESSING (PAR2 + Extraction) ===
                 logger.info(f"Download complete, checking post-processing...")
@@ -701,13 +775,18 @@ class DLERApp:
                         if early_par2_result:
                             verified, _, msg = early_par2_result
                             logger.info(f"Early PAR2 result available: verified={verified}, {msg}")
+                            if not verified:
+                                self._log("PAR2: Repair needed", "warning")
 
+                    self._log("Post-processing started...", "info")
                     logger.info("Starting post-processing...")
                     self._run_post_processing(
                         nzb_path,
                         early_par2_result=early_par2_result,
                         download_size=self._state.downloaded_bytes,
-                        download_duration=elapsed
+                        download_duration=elapsed,
+                        direct_to_destination=direct_to_destination,
+                        actual_download_dir=download_dir
                     )
                     logger.info("Post-processing finished")
                 else:
@@ -715,6 +794,7 @@ class DLERApp:
             else:
                 logger.warning("Download returned False - check [STATS] logs above")
                 self._queue_info_var.set("Download incomplete")
+                self._log("Download incomplete - some segments failed", "error")
                 # Show warning for incomplete download
                 self._master.after(100, lambda: self._show_warning(
                     "Incomplete Download",
@@ -729,6 +809,7 @@ class DLERApp:
         except Exception as e:
             logger.error(f"Download error: {e}")
             self._queue_info_var.set(f"Error: {e}")
+            self._log(f"Error: {e}", "error")
         finally:
             self._state.is_downloading = False
             self._state.current_file = ""
@@ -740,7 +821,9 @@ class DLERApp:
         nzb_path: Path,
         early_par2_result: Optional[Tuple[bool, bool, str]] = None,
         download_size: int = 0,
-        download_duration: float = 0.0
+        download_duration: float = 0.0,
+        direct_to_destination: bool = False,
+        actual_download_dir: Optional[Path] = None
     ) -> None:
         """
         Run PAR2 verification and extraction.
@@ -750,6 +833,8 @@ class DLERApp:
             early_par2_result: Optional (verified, repaired, message) from streaming PAR2
             download_size: Total bytes downloaded
             download_duration: Download time in seconds
+            direct_to_destination: If True, files were downloaded directly to final location
+            actual_download_dir: Actual directory where files were downloaded
         """
         logger.info(f"=== _run_post_processing called for {nzb_path.name} ===")
         try:
@@ -759,18 +844,52 @@ class DLERApp:
             self._queue_info_var.set("Post-processing...")
             logger.info(f"Starting post-processing for {nzb_path.name}")
 
-            # Get download directory
-            download_dir = Path(self._config.download.output_dir)
+            # Get download directory (use actual if provided, else config)
+            download_dir = actual_download_dir or Path(self._config.download.output_dir)
             extract_dir = Path(self._config.postprocess.extract_dir)
 
+            if direct_to_destination:
+                logger.info(f"DIRECT-TO-DESTINATION mode: files already at {download_dir}")
+
+            # Smooth progress animation state
+            pp_current_progress = [0.0]  # Use list for mutable closure
+            pp_target_progress = [0.0]
+            pp_animation_id = [None]
+
+            def animate_progress():
+                """Smoothly animate progress bar toward target value."""
+                if not self._state.is_post_processing:
+                    return
+
+                current = pp_current_progress[0]
+                target = pp_target_progress[0]
+
+                if abs(target - current) < 0.1:
+                    # Close enough, snap to target
+                    pp_current_progress[0] = target
+                else:
+                    # Move 15% of remaining distance (smooth easing)
+                    pp_current_progress[0] = current + (target - current) * 0.15
+
+                # Update UI
+                display_val = pp_current_progress[0]
+                self._progress_var.set(display_val)
+                self._percent_var.set(f"{display_val:5.1f}%")
+
+                # Continue animation
+                if self._state.is_post_processing:
+                    pp_animation_id[0] = self._master.after(30, animate_progress)
+
             def progress_callback(msg: str, percent: float):
-                # Schedule ALL updates on main thread (Tkinter is not thread-safe)
+                """Handle progress updates from post-processor."""
                 def update_ui():
                     self._queue_info_var.set(f"PP: {msg}")
                     if percent >= 0:
+                        pp_target_progress[0] = percent
                         self._state.progress_percent = percent
-                        self._progress_var.set(percent)
-                        self._percent_var.set(f"{percent:5.1f}%")
+                        # Start animation if not running
+                        if pp_animation_id[0] is None:
+                            animate_progress()
                 self._master.after(0, update_ui)
                 logger.debug(f"PP Progress: {msg} ({percent}%)")
 
@@ -779,6 +898,8 @@ class DLERApp:
 
             # Reset progress bar for post-processing (on main thread)
             def init_pp_ui():
+                pp_current_progress[0] = 0.0
+                pp_target_progress[0] = 0.0
                 self._state.progress_percent = 0
                 self._progress_var.set(0)
                 self._percent_var.set("  0.0%")
@@ -792,9 +913,12 @@ class DLERApp:
             if early_par2_result:
                 logger.info(f"Early PAR2 result: {early_par2_result}")
 
+            # For direct-to-destination, download_dir and extract_dir are the same
+            effective_extract_dir = download_dir if direct_to_destination else extract_dir
+
             processor = PostProcessor(
                 download_dir=download_dir,
-                extract_dir=extract_dir,
+                extract_dir=effective_extract_dir,
                 par2_path=self._config.postprocess.par2_path or None,
                 sevenzip_path=self._config.postprocess.sevenzip_path or None,
                 cleanup_after_extract=self._config.postprocess.cleanup_after_extract,
@@ -802,10 +926,14 @@ class DLERApp:
             )
 
             logger.info(f"PostProcessor created. PAR2={processor.par2_path}, 7z={processor.sevenzip_path}")
-            logger.info("Calling processor.process()...")
+            logger.info(f"Calling processor.process(direct_to_destination={direct_to_destination})...")
 
             # Pass early PAR2 result to skip re-verification if already done
-            result = processor.process(nzb_path, early_par2_result=early_par2_result)
+            result = processor.process(
+                nzb_path,
+                early_par2_result=early_par2_result,
+                direct_to_destination=direct_to_destination
+            )
             logger.info(f"processor.process() returned: success={result.success}, msg={result.message}")
 
             if result.success:
@@ -816,11 +944,20 @@ class DLERApp:
                 self._queue_info_var.set(msg)
                 logger.info(f"Post-processing completed: {result.message}")
 
+                # Log success with details
+                log_msg = f"Completed: {result.files_extracted} file(s)"
+                if result.par2_repaired:
+                    log_msg += " (PAR2 repaired)"
+                if result.extract_path:
+                    log_msg += f" -> {result.extract_path.name}"
+                self._log(log_msg, "success")
+
                 # Show single completion summary with all metrics
                 self._show_completion_summary(result, download_size, download_duration)
             else:
                 self._queue_info_var.set(f"PP Error: {result.message[:30]}")
                 logger.error(f"Post-processing failed: {result.message}")
+                self._log(f"Post-processing failed: {result.message}", "error")
                 # Show error details
                 self._master.after(100, lambda: self._show_warning(
                     "Post-Processing Failed",
@@ -833,6 +970,7 @@ class DLERApp:
         except Exception as e:
             logger.error(f"Post-processing error: {e}")
             self._queue_info_var.set(f"PP Error: {str(e)[:30]}")
+            self._log(f"Post-processing error: {e}", "error")
         finally:
             # Exit post-processing mode
             self._state.is_post_processing = False
@@ -876,11 +1014,13 @@ class DLERApp:
             self._state.connections_active = conn_count
             self._state.connections_total = conn_count  # Use actual connected count
             self._queue_info_var.set(f"Connected: {conn_count} connections")
+            self._log(f"Connected to {self._config.server.host} ({conn_count} connections)", "success")
 
         except Exception as e:
             logger.error(f"Init failed: {e}")
             self._turbo_engine = None
             self._queue_info_var.set(f"Connection failed")
+            self._log(f"Connection failed: {e}", "error")
 
     def _parse_nzb_size(self, nzb_path: Path) -> None:
         """Parse NZB size."""
@@ -995,7 +1135,7 @@ class DLERApp:
             self._speed_graph.update_speed(0.0)
 
         self._download_queue.clear()
-        self._queue_listbox.delete(0, "end")
+        self._log("Download stopped by user", "warning")
         self._stop_btn.config(state="disabled")
         self._pause_btn.config(state="disabled", text="Pause")
         self._queue_info_var.set("Stopped")
@@ -1131,8 +1271,8 @@ class DLERApp:
         self._speed_var.set(speed_val)
         self._speed_unit_var.set(speed_unit)
 
-        # Update speed graph
-        if self._speed_graph and self._state.is_downloading:
+        # Update speed graph (only during actual download, not post-processing)
+        if self._speed_graph and self._state.is_downloading and not self._state.is_post_processing:
             self._speed_graph.update_speed(self._state.speed_mbps)
 
         # Progress (skip update during post-processing to let PP control it)
