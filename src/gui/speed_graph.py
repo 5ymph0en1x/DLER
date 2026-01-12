@@ -2,63 +2,56 @@
 DLER Speed Graph Widget
 =======================
 
-Windows 11-style animated speed graph using pure Tkinter Canvas.
-Shows download speed history with gradient fill area chart.
+Elegant speed graph showing complete download history.
+All data points are preserved and compressed to fit the display.
+Resets on each new transfer.
 """
 
 from __future__ import annotations
 
 import tkinter as tk
-from collections import deque
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import math
 
 
 class SpeedGraphWidget(tk.Canvas):
     """
-    Animated speed graph widget with Windows 11-style gradient fill.
+    Speed graph widget showing complete transfer history.
 
     Features:
-    - Gradient area chart with glow effect
-    - Auto-scaling Y-axis based on max speed
-    - Rolling 60-second window of data
-    - EMA smoothing for stable display
-    - Grid lines and current speed label
+    - Fine anti-aliased line with subtle glow
+    - Preserves all data points (compresses X-axis)
+    - Auto-scaling Y-axis
+    - Gradient fill under curve
+    - Resets on each new transfer
     """
 
     # Colors matching DLER dark theme (park dark)
-    # Park dark theme background is ~#2b2b2b, we use slightly darker
-    BG_COLOR = "#252525"          # Close to interface background
-    GRID_COLOR = "#353535"        # Subtle grid lines
-    LINE_COLOR = "#217346"        # Forest green (park theme accent)
-    GLOW_COLOR = "#217346"        # Matching glow
-    TEXT_COLOR = "#909090"        # Muted text
-    ACCENT_COLOR = "#2d9254"      # Lighter forest green for highlights
+    BG_COLOR = "#252525"
+    GRID_COLOR = "#323232"
+    LINE_COLOR = "#217346"        # Forest green
+    LINE_GLOW = "#1a5c38"         # Darker green for glow
+    TEXT_COLOR = "#808080"
+    ACCENT_COLOR = "#2d9254"      # Lighter green for current speed
 
-    # Area fill colors (forest green tones for gradient effect)
-    FILL_COLOR_DARK = "#1a2a1a"   # Dark green-gray for bottom
-    FILL_COLOR_MID = "#1f3a25"    # Mid forest green
-    FILL_COLOR_LIGHT = "#254a2d"  # Lighter green near line
+    # Gradient fill colors (subtle)
+    FILL_COLORS = [
+        "#1a1f1a",  # Bottom - almost black
+        "#1c241c",
+        "#1e291e",
+        "#202e20",
+        "#223322",
+        "#243824",  # Top - subtle green
+    ]
 
     def __init__(
         self,
         parent,
         width: int = 400,
         height: int = 100,
-        max_samples: int = 60,
         update_interval_ms: int = 100,
         **kwargs
     ):
-        """
-        Initialize the speed graph widget.
-
-        Args:
-            parent: Parent Tkinter widget
-            width: Canvas width in pixels
-            height: Canvas height in pixels
-            max_samples: Number of samples to display (default 60 = 60 seconds at 1/s)
-            update_interval_ms: Animation update interval
-        """
         super().__init__(
             parent,
             width=width,
@@ -70,107 +63,61 @@ class SpeedGraphWidget(tk.Canvas):
 
         self._width = width
         self._height = height
-        self._max_samples = max_samples
         self._update_interval = update_interval_ms
 
-        # Data storage with EMA smoothing
-        self._speed_history: deque[float] = deque(maxlen=max_samples)
+        # Data storage - list grows indefinitely, no sliding window
+        self._speed_history: List[float] = []
         self._current_speed: float = 0.0
         self._ema_speed: float = 0.0
-        self._ema_alpha: float = 0.3  # Smoothing factor
+        self._ema_alpha: float = 0.25
 
         # Auto-scaling Y-axis
-        self._max_speed_seen: float = 10.0  # Start with 10 MB/s minimum
-        self._scale_decay: float = 0.995  # Slow decay for max scale
+        self._max_speed_seen: float = 10.0
+        self._display_max: float = 10.0  # Smoothed display max
 
-        # Drawing margins
-        self._margin_left = 45
-        self._margin_right = 10
-        self._margin_top = 8
-        self._margin_bottom = 20
+        # Compact margins to maximize graph area
+        self._margin_left = 32
+        self._margin_right = 58  # Space for speed indicator
+        self._margin_top = 4
+        self._margin_bottom = 12
 
         # Pre-compute graph area
-        self._graph_width = width - self._margin_left - self._margin_right
-        self._graph_height = height - self._margin_top - self._margin_bottom
-
-        # Gradient cache (more strips = smoother gradient)
-        self._gradient_colors = self._generate_gradient(30)
+        self._graph_x0 = self._margin_left
+        self._graph_x1 = width - self._margin_right
+        self._graph_y0 = self._margin_top
+        self._graph_y1 = height - self._margin_bottom
+        self._graph_width = self._graph_x1 - self._graph_x0
+        self._graph_height = self._graph_y1 - self._graph_y0
 
         # Animation state
         self._animation_id: Optional[str] = None
         self._is_running: bool = False
 
-        # Initialize with zeros
-        for _ in range(max_samples):
-            self._speed_history.append(0.0)
-
-        # Draw initial state
+        # Draw initial empty state
         self._draw_frame()
 
-    def _generate_gradient(self, steps: int) -> list[str]:
-        """Generate gradient colors from bottom (dark) to top (lighter green)."""
-        colors = []
-
-        # Three-point gradient: dark -> mid -> light
-        r1, g1, b1 = self._hex_to_rgb(self.FILL_COLOR_DARK)
-        r2, g2, b2 = self._hex_to_rgb(self.FILL_COLOR_MID)
-        r3, g3, b3 = self._hex_to_rgb(self.FILL_COLOR_LIGHT)
-
-        for i in range(steps):
-            t = i / (steps - 1) if steps > 1 else 0
-
-            # Two-phase interpolation for richer gradient
-            if t < 0.5:
-                # Dark to mid
-                t2 = t * 2
-                r = int(r1 + (r2 - r1) * t2)
-                g = int(g1 + (g2 - g1) * t2)
-                b = int(b1 + (b2 - b1) * t2)
-            else:
-                # Mid to light
-                t2 = (t - 0.5) * 2
-                r = int(r2 + (r3 - r2) * t2)
-                g = int(g2 + (g3 - g2) * t2)
-                b = int(b2 + (b3 - b2) * t2)
-
-            colors.append(f"#{r:02x}{g:02x}{b:02x}")
-
-        return colors
-
-    @staticmethod
-    def _hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
-        """Convert hex color to RGB tuple."""
-        hex_color = hex_color.lstrip('#')
-        return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-
     def update_speed(self, speed_mbps: float) -> None:
-        """
-        Update the graph with a new speed value.
-
-        Args:
-            speed_mbps: Current download speed in MB/s
-        """
+        """Add a new speed sample."""
         self._current_speed = max(0.0, speed_mbps)
 
-        # Apply EMA smoothing
-        self._ema_speed = (
-            self._ema_alpha * self._current_speed +
-            (1 - self._ema_alpha) * self._ema_speed
-        )
+        # EMA smoothing
+        if not self._speed_history:
+            self._ema_speed = self._current_speed
+        else:
+            self._ema_speed = (
+                self._ema_alpha * self._current_speed +
+                (1 - self._ema_alpha) * self._ema_speed
+            )
 
-        # Add to history
         self._speed_history.append(self._ema_speed)
 
-        # Update max scale (with slow decay for smooth scaling)
+        # Update max scale
         if self._ema_speed > self._max_speed_seen:
-            self._max_speed_seen = self._ema_speed * 1.2  # 20% headroom
-        else:
-            # Slowly decay max to allow scale to shrink over time
-            self._max_speed_seen = max(
-                10.0,  # Minimum scale
-                self._max_speed_seen * self._scale_decay,
-                max(self._speed_history) * 1.2 if self._speed_history else 10.0
-            )
+            self._max_speed_seen = self._ema_speed
+
+        # Smooth display max (gradual scaling)
+        target_max = max(10.0, self._max_speed_seen * 1.15)
+        self._display_max += (target_max - self._display_max) * 0.1
 
     def start_animation(self) -> None:
         """Start the animation loop."""
@@ -186,268 +133,171 @@ class SpeedGraphWidget(tk.Canvas):
             self._animation_id = None
 
     def reset(self) -> None:
-        """Reset the graph to initial state."""
+        """Reset for a new transfer."""
         self._speed_history.clear()
-        for _ in range(self._max_samples):
-            self._speed_history.append(0.0)
         self._current_speed = 0.0
         self._ema_speed = 0.0
         self._max_speed_seen = 10.0
+        self._display_max = 10.0
         self._draw_frame()
 
     def _animate(self) -> None:
         """Animation loop."""
         if not self._is_running:
             return
-
         self._draw_frame()
         self._animation_id = self.after(self._update_interval, self._animate)
 
     def _draw_frame(self) -> None:
-        """Draw a single frame of the graph."""
+        """Draw a complete frame."""
         self.delete("all")
-
-        # Draw background grid
         self._draw_grid()
 
-        # Draw the area chart with gradient
-        self._draw_area_chart()
+        if len(self._speed_history) >= 2:
+            points = self._compute_display_points()
+            self._draw_gradient_fill(points)
+            self._draw_line(points)
+            self._draw_endpoint(points)
 
-        # Draw the line on top
-        self._draw_speed_line()
+        self._draw_labels()
 
-        # Draw Y-axis labels
-        self._draw_y_labels()
+    def _compute_display_points(self) -> List[Tuple[float, float]]:
+        """Compute display points, downsampling if needed for performance."""
+        samples = self._speed_history
+        n = len(samples)
 
-        # Draw current speed value
-        self._draw_current_speed()
+        if n == 0:
+            return []
+
+        # Maximum points to render (for performance)
+        max_points = min(n, self._graph_width)
+
+        points = []
+
+        if n <= max_points:
+            # Use all points
+            for i, speed in enumerate(samples):
+                x = self._graph_x0 + (self._graph_width * i / max(1, n - 1))
+                y = self._speed_to_y(speed)
+                points.append((x, y))
+        else:
+            # Downsample using LTTB-like algorithm (largest triangle)
+            step = n / max_points
+            for i in range(max_points):
+                idx = int(i * step)
+                # Average nearby samples for smoother downsampling
+                start_idx = max(0, idx - 1)
+                end_idx = min(n, idx + 2)
+                avg_speed = sum(samples[start_idx:end_idx]) / (end_idx - start_idx)
+
+                x = self._graph_x0 + (self._graph_width * i / max(1, max_points - 1))
+                y = self._speed_to_y(avg_speed)
+                points.append((x, y))
+
+        return points
 
     def _draw_grid(self) -> None:
-        """Draw background grid lines."""
-        x0 = self._margin_left
-        x1 = self._width - self._margin_right
-        y0 = self._margin_top
-        y1 = self._height - self._margin_bottom
+        """Draw subtle grid."""
+        x0, x1 = self._graph_x0, self._graph_x1
+        y0, y1 = self._graph_y0, self._graph_y1
 
-        # Horizontal grid lines (4 lines)
-        for i in range(5):
-            y = y0 + (y1 - y0) * i / 4
-            self.create_line(
-                x0, y, x1, y,
-                fill=self.GRID_COLOR,
-                width=1,
-                dash=(2, 4)
-            )
-
-        # Vertical grid lines (6 lines for 60 seconds)
-        for i in range(7):
-            x = x0 + (x1 - x0) * i / 6
-            self.create_line(
-                x, y0, x, y1,
-                fill=self.GRID_COLOR,
-                width=1,
-                dash=(2, 4)
-            )
+        # Horizontal lines (3 divisions)
+        for i in range(4):
+            y = y0 + (y1 - y0) * i / 3
+            self.create_line(x0, y, x1, y, fill=self.GRID_COLOR, width=1)
 
         # Border
-        self.create_rectangle(
-            x0, y0, x1, y1,
-            outline=self.GRID_COLOR,
-            width=1
-        )
+        self.create_rectangle(x0, y0, x1, y1, outline=self.GRID_COLOR, width=1)
 
-    def _draw_area_chart(self) -> None:
-        """Draw gradient-filled area under the speed line."""
-        if not self._speed_history or self._max_speed_seen <= 0:
+    def _draw_gradient_fill(self, points: List[Tuple[float, float]]) -> None:
+        """Draw gradient fill under the curve."""
+        if len(points) < 2:
             return
 
-        x0 = self._margin_left
-        x1 = self._margin_left + self._graph_width
-        y_bottom = self._height - self._margin_bottom
-        y_top = self._margin_top
+        n_bands = len(self.FILL_COLORS)
+        band_height = self._graph_height / n_bands
 
-        samples = list(self._speed_history)
-        n_samples = len(samples)
+        for band_idx, color in enumerate(self.FILL_COLORS):
+            band_bottom = self._graph_y1 - band_idx * band_height
+            band_top = band_bottom - band_height
 
-        if n_samples < 2:
+            # Build polygon for this band
+            poly = [self._graph_x0, band_bottom]
+
+            for px, py in points:
+                clamped_y = max(band_top, min(band_bottom, py))
+                poly.extend([px, clamped_y])
+
+            poly.extend([self._graph_x1, band_bottom])
+
+            if len(poly) >= 6:
+                self.create_polygon(poly, fill=color, outline="")
+
+    def _draw_line(self, points: List[Tuple[float, float]]) -> None:
+        """Draw anti-aliased line with subtle glow."""
+        if len(points) < 2:
             return
 
-        # Pre-compute data points (x, y) for the curve
-        data_points = []
-        for i, speed in enumerate(samples):
-            x = x0 + (self._graph_width * i / (n_samples - 1))
-            y = self._speed_to_y(speed)
-            data_points.append((x, y))
+        # Flatten points for create_line
+        flat = []
+        for x, y in points:
+            flat.extend([x, y])
 
-        # Draw gradient using horizontal strips from bottom to top
-        n_strips = len(self._gradient_colors)
-        strip_height = (y_bottom - y_top) / n_strips
-
-        for strip_idx, color in enumerate(self._gradient_colors):
-            # Strip boundaries (bottom strip = index 0, top strip = last index)
-            strip_y_bottom = y_bottom - strip_idx * strip_height
-            strip_y_top = strip_y_bottom - strip_height
-
-            # Build polygon for this strip: bottom-left -> curve points -> bottom-right
-            strip_points = []
-
-            # Start at bottom-left of strip
-            strip_points.append(x0)
-            strip_points.append(strip_y_bottom)
-
-            # Add curve points, clamped to strip boundaries
-            for px, py in data_points:
-                # Clamp Y to be within the strip (top is smaller Y value)
-                clamped_y = max(strip_y_top, min(strip_y_bottom, py))
-                strip_points.append(px)
-                strip_points.append(clamped_y)
-
-            # End at bottom-right of strip
-            strip_points.append(x1)
-            strip_points.append(strip_y_bottom)
-
-            # Draw the strip polygon
-            if len(strip_points) >= 6:  # At least 3 points
-                self.create_polygon(
-                    strip_points,
-                    fill=color,
-                    outline="",
-                    width=0
-                )
-
-    def _draw_speed_line(self) -> None:
-        """Draw the speed line on top of the area with antialiasing effect."""
-        if not self._speed_history:
-            return
-
-        samples = list(self._speed_history)
-        n_samples = len(samples)
-
-        if n_samples < 2:
-            return
-
-        x0 = self._margin_left
-
-        # Build line points
-        points = []
-        for i, speed in enumerate(samples):
-            x = x0 + (self._graph_width * i / (n_samples - 1))
-            y = self._speed_to_y(speed)
-            points.extend([x, y])
-
-        # Antialiasing: draw glow layers underneath (darker to lighter)
-        # Layer 1: Dark glow (wider)
+        # Single fine line (no glow)
         self.create_line(
-            points,
-            fill=self.FILL_COLOR_MID,  # Dark green glow
-            width=5,
-            smooth=True,
-            splinesteps=24,
-            capstyle="round",
-            joinstyle="round"
-        )
-
-        # Layer 2: Medium glow
-        self.create_line(
-            points,
-            fill=self.FILL_COLOR_LIGHT,  # Medium green
-            width=3,
-            smooth=True,
-            splinesteps=24,
-            capstyle="round",
-            joinstyle="round"
-        )
-
-        # Main line (on top)
-        self.create_line(
-            points,
+            flat,
             fill=self.LINE_COLOR,
-            width=2,
+            width=1,
             smooth=True,
-            splinesteps=24,  # Higher = smoother curve
+            splinesteps=64,
             capstyle="round",
             joinstyle="round"
         )
 
-        # Draw highlight dot at current position
-        if points:
-            last_x, last_y = points[-2], points[-1]
-            # Outer glow
-            self.create_oval(
-                last_x - 5, last_y - 5,
-                last_x + 5, last_y + 5,
-                fill="",
-                outline=self.GLOW_COLOR,
-                width=2
-            )
-            # Inner dot
-            self.create_oval(
-                last_x - 3, last_y - 3,
-                last_x + 3, last_y + 3,
-                fill=self.ACCENT_COLOR,
-                outline=""
-            )
+    def _draw_endpoint(self, points: List[Tuple[float, float]]) -> None:
+        """Draw small indicator at current position."""
+        if not points:
+            return
 
-    def _draw_y_labels(self) -> None:
-        """Draw Y-axis scale labels."""
-        x = self._margin_left - 3
-        y0 = self._margin_top
-        y1 = self._height - self._margin_bottom
+        x, y = points[-1]
+        r = 2  # Tiny dot
 
-        # Draw 3 labels: max, mid, 0 (compact format)
-        max_label = self._format_speed_compact(self._max_speed_seen)
-        mid_label = self._format_speed_compact(self._max_speed_seen / 2)
-
-        self.create_text(
-            x, y0,
-            text=max_label,
-            anchor="e",
-            fill=self.TEXT_COLOR,
-            font=("Consolas", 7)
+        # Simple dot (no glow)
+        self.create_oval(
+            x - r, y - r, x + r, y + r,
+            fill=self.LINE_COLOR, outline=""
         )
 
-        self.create_text(
-            x, (y0 + y1) / 2,
-            text=mid_label,
-            anchor="e",
-            fill=self.TEXT_COLOR,
-            font=("Consolas", 7)
-        )
+    def _draw_labels(self) -> None:
+        """Draw Y-axis labels and current speed."""
+        # Y-axis labels (max and 0)
+        max_label = self._format_compact(self._display_max)
 
         self.create_text(
-            x, y1,
-            text="0",
-            anchor="e",
-            fill=self.TEXT_COLOR,
-            font=("Consolas", 7)
+            self._graph_x0 - 3, self._graph_y0,
+            text=max_label, anchor="e",
+            fill=self.TEXT_COLOR, font=("Consolas", 7)
+        )
+        self.create_text(
+            self._graph_x0 - 3, self._graph_y1,
+            text="0", anchor="e",
+            fill=self.TEXT_COLOR, font=("Consolas", 7)
         )
 
-    def _draw_current_speed(self) -> None:
-        """Draw current speed value in top-right corner."""
+        # Current speed (right side)
         speed_text = self._format_speed(self._ema_speed)
-
-        x = self._width - self._margin_right - 5
-        y = self._margin_top + 12
-
-        # Background for readability
         self.create_text(
-            x, y,
-            text=speed_text,
-            anchor="e",
-            fill=self.ACCENT_COLOR,
-            font=("Consolas", 11, "bold")
+            self._width - 4, self._graph_y0 + 8,
+            text=speed_text, anchor="e",
+            fill=self.ACCENT_COLOR, font=("Consolas", 10, "bold")
         )
 
     def _speed_to_y(self, speed: float) -> float:
-        """Convert speed value to Y coordinate."""
-        if self._max_speed_seen <= 0:
-            return self._height - self._margin_bottom
-
-        ratio = min(1.0, speed / self._max_speed_seen)
-        y0 = self._margin_top
-        y1 = self._height - self._margin_bottom
-
-        return y1 - ratio * (y1 - y0)
+        """Convert speed to Y coordinate."""
+        if self._display_max <= 0:
+            return self._graph_y1
+        ratio = min(1.0, speed / self._display_max)
+        return self._graph_y1 - ratio * self._graph_height
 
     @staticmethod
     def _format_speed(speed: float) -> str:
@@ -462,8 +312,8 @@ class SpeedGraphWidget(tk.Canvas):
             return f"{speed / 1024:.2f} GB/s"
 
     @staticmethod
-    def _format_speed_compact(speed: float) -> str:
-        """Format speed in compact form for Y-axis labels."""
+    def _format_compact(speed: float) -> str:
+        """Compact format for Y-axis."""
         if speed < 1.0:
             return f"{speed * 1024:.0f}K"
         elif speed < 10:
@@ -474,39 +324,48 @@ class SpeedGraphWidget(tk.Canvas):
             return f"{speed / 1024:.1f}G"
 
 
-# Demo / test code
+# Demo
 if __name__ == "__main__":
     import random
 
     root = tk.Tk()
-    root.title("DLER Speed Graph Demo")
-    root.configure(bg="#2b2b2b")  # Park dark theme background
-    root.geometry("560x140")
+    root.title("DLER Speed Graph")
+    root.configure(bg="#2b2b2b")
+    root.geometry("700x120")
 
-    # Create widget (same size as in DLER GUI)
-    graph = SpeedGraphWidget(root, width=520, height=70)
-    graph.pack(padx=10, pady=10)
+    graph = SpeedGraphWidget(root, width=650, height=70)
+    graph.pack(padx=20, pady=20)
 
-    # Simulate speed updates with realistic pattern
     speed = 0.0
-    ramp_up = True
+    phase = 0
+    sample_count = 0
 
     def update():
-        global speed, ramp_up
-        if ramp_up:
-            # Ramp up to ~80 MB/s
-            speed = min(80, speed + random.uniform(2, 8))
-            if speed >= 75:
-                ramp_up = False
-        else:
-            # Fluctuate around current speed
-            speed = max(0, speed + random.uniform(-8, 8))
-            speed = min(120, speed)
+        global speed, phase, sample_count
+        sample_count += 1
+
+        # Simulate realistic download pattern
+        if phase == 0:  # Ramp up
+            speed = min(85, speed + random.uniform(3, 10))
+            if speed >= 80:
+                phase = 1
+        elif phase == 1:  # Steady with fluctuation
+            speed = max(20, min(100, speed + random.uniform(-5, 5)))
+            if sample_count > 200:
+                phase = 2
+        elif phase == 2:  # Slow down
+            speed = max(0, speed - random.uniform(1, 5))
+            if speed <= 5:
+                phase = 3
+        else:  # Done, reset
+            graph.reset()
+            speed = 0.0
+            phase = 0
+            sample_count = 0
 
         graph.update_speed(speed)
-        root.after(100, update)
+        root.after(50, update)
 
     graph.start_animation()
-    root.after(500, update)  # Start after brief delay
-
+    root.after(200, update)
     root.mainloop()
