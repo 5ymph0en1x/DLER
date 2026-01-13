@@ -112,6 +112,7 @@ git clone https://github.com/5ymph0en1x/DLER.git
 cd DLER
 
 # Install dependencies
+pip install cupy-cuda13x --pre -U -f https://pip.cupy.dev/pre --no-binary cupy -v
 pip install -r requirements.txt
 
 # (Optional) Build AVX2 decoder for maximum performance
