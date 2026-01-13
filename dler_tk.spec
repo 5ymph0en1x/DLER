@@ -1,15 +1,126 @@
 # -*- mode: python ; coding: utf-8 -*-
 # DLER Tkinter - PyInstaller Spec File
-# Optimized build with AVX2 native decoder
+# Dual build: Ultimate (CUDA) vs Basic (CPU-only)
+#
+# Usage:
+#   set DLER_BUILD=ultimate && pyinstaller dler_tk.spec   (1 GB, GPU support)
+#   set DLER_BUILD=basic && pyinstaller dler_tk.spec      (30 MB, CPU only)
 
 import os
 import sys
 
-# Get TKinterModernThemes paths - hardcoded for sylc2 environment
+# =============================================================================
+# BUILD CONFIGURATION
+# =============================================================================
+BUILD_MODE = os.environ.get('DLER_BUILD', 'ultimate').lower()
+IS_ULTIMATE = BUILD_MODE == 'ultimate'
+
+print(f"")
+print(f"{'='*60}")
+print(f"  DLER Build Mode: {'ULTIMATE (GPU/CUDA)' if IS_ULTIMATE else 'BASIC (CPU-only)'}")
+print(f"{'='*60}")
+print(f"")
+
+# Output name based on build mode
+EXE_NAME = 'DLER' if IS_ULTIMATE else 'DLER_Basic'
+
+# =============================================================================
+# PATHS
+# =============================================================================
 env_path = r'C:\Users\Symphoenix\anaconda3\envs\sylc2'
 tkmt_themes = os.path.join(env_path, 'Lib', 'site-packages', 'TKinterModernThemes', 'themes')
 tkmt_images = os.path.join(env_path, 'Lib', 'site-packages', 'TKinterModernThemes', 'images')
 
+# =============================================================================
+# HIDDEN IMPORTS
+# =============================================================================
+# Base imports (both versions)
+base_hiddenimports = [
+    'TKinterModernThemes',
+    'PIL',
+    'PIL.Image',
+    'PIL.ImageTk',
+    'src.gui.tkinter_app',
+    'src.gui.speed_graph',
+    'src.core',
+    'src.core.turbo_engine_v2',
+    'src.core.turbo_yenc',
+    'src.core.fast_nntp',
+    'src.core.post_processor',
+    'src.core.ram_processor',
+    'src.utils.config',
+    'yenc_turbo',
+    # NumPy (required for both)
+    'numpy',
+    'numpy._core',
+    'numpy._core._methods',
+    'numpy._core._multiarray_umath',
+]
+
+# CuPy imports (Ultimate only)
+cuda_hiddenimports = [
+    'cupy',
+    'cupy.cuda',
+    'cupy.cuda.runtime',
+    'cupy._core',
+    'cupy._core._carray',
+    'cupy._core._dtype',
+    'cupy._core._kernel',
+    'cupy._core._memory_range',
+    'cupy._core._routines_math',
+    'cupy._core._scalar',
+    'cupy._core.core',
+    'cupy._core.fusion',
+    'cupy._core.internal',
+    'cupy_backends',
+    'cupy_backends.cuda',
+    'cupy_backends.cuda._softlink',
+    'cupy_backends.cuda.api',
+    'cupy_backends.cuda.api._runtime_enum',
+    'cupy_backends.cuda.api._driver_enum',
+    'cupy_backends.cuda.api.runtime',
+    'cupy_backends.cuda.api.driver',
+    'cupy_backends.cuda.stream',
+]
+
+# Combine based on build mode
+hiddenimports = base_hiddenimports + (cuda_hiddenimports if IS_ULTIMATE else [])
+
+# =============================================================================
+# EXCLUDES
+# =============================================================================
+# Base excludes (both versions)
+base_excludes = [
+    'numba',
+    'torch',
+    'tensorflow',
+    'scipy',
+    'matplotlib',
+    'pandas',
+    'PySide6',
+    'PyQt5',
+    'PyQt6',
+    'pyqtgraph',
+    'IPython',
+    'jupyter',
+    'pytest',
+    'opencv',
+    'cv2',
+]
+
+# Additional excludes for Basic version (no CUDA)
+basic_excludes = [
+    'cupy',
+    'cupy_backends',
+    'cupyx',
+]
+
+# Combine based on build mode
+excludes = base_excludes + ([] if IS_ULTIMATE else basic_excludes)
+
+# =============================================================================
+# ANALYSIS
+# =============================================================================
 a = Analysis(
     ['tk_main.py'],
     pathex=['.', 'src'],
@@ -27,72 +138,13 @@ a = Analysis(
         (tkmt_themes, 'TKinterModernThemes/themes'),
         (tkmt_images, 'TKinterModernThemes/images'),
     ],
-    hiddenimports=[
-        'TKinterModernThemes',
-        'PIL',
-        'PIL.Image',
-        'PIL.ImageTk',
-        'src.gui.tkinter_app',
-        'src.gui.speed_graph',
-        'src.core',
-        'src.core.turbo_engine_v2',
-        'src.core.turbo_yenc',
-        'src.core.fast_nntp',
-        'src.core.post_processor',
-        'src.core.ram_processor',
-        'src.utils.config',
-        'yenc_turbo',
-        # NumPy 2.x + CuPy for GPU acceleration
-        'numpy',
-        'numpy._core',
-        'numpy._core._methods',
-        'numpy._core._multiarray_umath',
-        'cupy',
-        'cupy.cuda',
-        'cupy.cuda.runtime',
-        'cupy._core',
-        'cupy._core._carray',
-        'cupy._core._dtype',
-        'cupy._core._kernel',
-        'cupy._core._memory_range',
-        'cupy._core._routines_math',
-        'cupy._core._scalar',
-        'cupy._core.core',
-        'cupy._core.fusion',
-        'cupy._core.internal',
-        'cupy_backends',
-        'cupy_backends.cuda',
-        'cupy_backends.cuda._softlink',
-        'cupy_backends.cuda.api',
-        'cupy_backends.cuda.api._runtime_enum',
-        'cupy_backends.cuda.api._driver_enum',
-        'cupy_backends.cuda.api.runtime',
-        'cupy_backends.cuda.api.driver',
-        'cupy_backends.cuda.stream',
-    ],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[
-        # Exclude large/problematic packages (but NOT numpy/cupy - needed for GPU!)
-        'numba',
-        'torch',
-        'tensorflow',
-        'scipy',
-        'matplotlib',
-        'pandas',
-        'PySide6',
-        'PyQt5',
-        'PyQt6',
-        'pyqtgraph',
-        'IPython',
-        'jupyter',
-        'pytest',
-        'opencv',
-        'cv2',
-    ],
+    excludes=excludes,
     noarchive=False,
-    optimize=0,  # Must be 0 for NumPy 2.x (optimize=2 removes docstrings which breaks numpy)
+    optimize=0,  # Must be 0 for NumPy 2.x
 )
 
 pyz = PYZ(a.pure)
@@ -103,7 +155,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='DLER',
+    name=EXE_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -117,5 +169,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['logo.png'],
-    version='version_info.py',  # Windows version info
+    version='version_info.py',
 )
