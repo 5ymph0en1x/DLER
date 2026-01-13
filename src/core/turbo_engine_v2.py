@@ -46,6 +46,14 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
+# RAM-based processing support
+try:
+    from .ram_processor import RamBuffer
+    HAS_RAM_PROCESSOR = True
+except ImportError:
+    HAS_RAM_PROCESSOR = False
+    RamBuffer = None  # Type hint placeholder
+
 def get_process_memory_mb() -> float:
     """Get current process memory usage in MB."""
     if HAS_PSUTIL:
@@ -295,7 +303,11 @@ class TurboEngineV2:
         writer_threads: int = 12,    # Increased for throughput
         pipeline_depth: int = 30,    # Deeper pipeline
         write_through: bool = False, # Bypass OS cache
-        on_progress: Optional[Callable] = None
+        on_progress: Optional[Callable] = None,
+        on_file_complete: Optional[Callable[[Path, str], None]] = None,  # Streaming PAR2 callback
+        ram_buffer: Optional['RamBuffer'] = None,  # RAM-based storage (no disk writes)
+        raw_queue_size: int = 16000,   # ~12 GB buffer for raw data
+        write_queue_size: int = 8000   # ~6 GB buffer for decoded data
     ):
         self.server_config = server_config
         self.output_dir = Path(output_dir)
@@ -306,6 +318,11 @@ class TurboEngineV2:
         self.pipeline_depth = pipeline_depth
         self.write_through = write_through
         self.on_progress = on_progress
+        self.on_file_complete = on_file_complete  # Called when individual file finishes
+        self.ram_buffer = ram_buffer  # If set, write to RAM instead of disk
+        self.ram_mode = ram_buffer is not None
+        self.raw_queue_size = raw_queue_size
+        self.write_queue_size = write_queue_size
 
         # Connections
         self._connections: List[NNTPConnection] = []
@@ -327,14 +344,12 @@ class TurboEngineV2:
         # Speed tracker with smoothing
         self._speed_tracker = SpeedTracker(window_seconds=3.0, alpha=0.25)
 
-        # === THREE SEPARATE QUEUES - OPTIMIZED FOR 64GB RAM ===
-        # LARGE queues for maximum throughput (~750KB per segment)
-        # 4000 raw + 2000 decoded = ~4.8 GB max in queues
-        # Queue 1: Raw downloaded data (from download threads)
-        self._raw_queue: Queue[Tuple[NZBSegment, bytes]] = Queue(maxsize=4000)
-
-        # Queue 2: Decoded data ready for writing (from decoder threads)
-        self._write_queue: Queue[DecodedSegment] = Queue(maxsize=2000)
+        # === LARGE QUEUES FOR MAXIMUM THROUGHPUT ===
+        # Buffer size determines how much data can be downloaded before backpressure kicks in
+        # Each segment ~750KB, so 16000 segments = ~12GB buffer
+        # This allows full-speed download even if disk is slower than network
+        self._raw_queue: Queue[Tuple[NZBSegment, bytes]] = Queue(maxsize=self.raw_queue_size)
+        self._write_queue: Queue[DecodedSegment] = Queue(maxsize=self.write_queue_size)
 
         # File handles with mmap for fast writes
         # Dict[file_index] -> [fd, mmap, size, write_count]
@@ -450,20 +465,9 @@ class TurboEngineV2:
         self._renamed_files.clear()
         self._file_paths.clear()
 
-        print(f"\nDownloading {len(files)} files, {self._stats.segments_total} segments")
-
-        # Show backend info
-        if NATIVE_AVAILABLE:
-            print("[DECODER] Native C++ (GIL-free)")
-        elif NUMBA_AVAILABLE:
-            print("[DECODER] Numba JIT")
-        else:
-            print("[DECODER] NumPy fallback")
-
-        print(f"\n[ARCHITECTURE] Separated Pipeline:")
-        print(f"  -> {len(self._connections)} download threads (network)")
-        print(f"  -> {self.decoder_threads} decoder threads (CPU)")
-        print(f"  -> {self.writer_threads} writer threads (disk)")
+        logger.info(f"[DOWNLOAD] Starting: {len(files)} files, {self._stats.segments_total} segments")
+        logger.info(f"[DOWNLOAD] Pipeline: {len(self._connections)} connections, "
+                   f"{self.decoder_threads} decoders, {self.writer_threads} writers")
         print()
 
         self._running = True
@@ -471,7 +475,7 @@ class TurboEngineV2:
         try:
             # Prepare output files with memory mapping
             # Also initialize progress tracking for progressive finalization
-            logger.info(f"[PREPARE] Preparing {len(files)} files...")
+            logger.info(f"[PREPARE] Preparing {len(files)} files... (RAM mode: {self.ram_mode})")
             for nzb_file in files:
                 logger.debug(f"[PREPARE] File {nzb_file.index}: '{nzb_file.filename}' ({nzb_file.size} bytes, {len(nzb_file.segments)} segments)")
                 self._prepare_file(nzb_file)
@@ -496,7 +500,12 @@ class TurboEngineV2:
                     segment_map[seg.message_id] = seg
 
             # === START ALL THREAD POOLS ===
-            print("Starting thread pools...", flush=True)
+            raw_buffer_gb = self.raw_queue_size * 750 / 1024 / 1024  # ~750KB per segment
+            write_buffer_gb = self.write_queue_size * 750 / 1024 / 1024
+            logger.info(f"[THREADS] Starting pools: {len(self._connections)} connections, "
+                       f"{self.decoder_threads} decoders, {self.writer_threads} writers")
+            logger.info(f"[BUFFERS] raw_queue={self.raw_queue_size} (~{raw_buffer_gb:.1f}GB), "
+                       f"write_queue={self.write_queue_size} (~{write_buffer_gb:.1f}GB)")
 
             # 1. Writer threads (start first - consumers)
             writer_threads = []
@@ -508,7 +517,6 @@ class TurboEngineV2:
                 )
                 t.start()
                 writer_threads.append(t)
-            print(f"  Writers: {len(writer_threads)} started", flush=True)
 
             # 2. Decoder threads (middle - transform)
             decoder_threads = []
@@ -520,7 +528,6 @@ class TurboEngineV2:
                 )
                 t.start()
                 decoder_threads.append(t)
-            print(f"  Decoders: {len(decoder_threads)} started", flush=True)
 
             # 3. Download threads (start last - producers)
             download_threads = []
@@ -536,7 +543,6 @@ class TurboEngineV2:
                 # Stagger starts for smooth flow
                 if i < len(self._connections) - 1:
                     time.sleep(0.003)
-            print(f"  Downloads: {len(download_threads)} started", flush=True)
 
             # 4. Progress reporter
             progress_thread = threading.Thread(
@@ -545,18 +551,33 @@ class TurboEngineV2:
                 daemon=True
             )
             progress_thread.start()
-            print("  Progress reporter started", flush=True)
-            print()
+            logger.info(f"[THREADS] All pools started: {len(download_threads)} downloaders active")
 
             # Wait for downloads to complete
-            logger.info("[SHUTDOWN] Waiting for download threads to finish...")
-            for i, t in enumerate(download_threads):
-                t.join(timeout=60)  # 60 second timeout
-                if t.is_alive():
-                    logger.warning(f"[SHUTDOWN] Download thread {i} still alive after 60s!")
-                else:
-                    logger.debug(f"[SHUTDOWN] Download thread {i} finished")
-            logger.info("[SHUTDOWN] All download threads done")
+            logger.info(f"[THREADS] Waiting for {len(download_threads)} download threads...")
+            threads_alive = len(download_threads)
+            check_interval = 5  # Check every 5 seconds
+            max_wait = 600  # 10 minutes max
+            waited = 0
+
+            while threads_alive > 0 and waited < max_wait:
+                time.sleep(check_interval)
+                waited += check_interval
+                threads_alive = sum(1 for t in download_threads if t.is_alive())
+
+                # Log progress with queue status
+                raw_q = self._raw_queue.qsize()
+                write_q = self._write_queue.qsize()
+                raw_pct = raw_q * 100 // self.raw_queue_size if self.raw_queue_size else 0
+                write_pct = write_q * 100 // self.write_queue_size if self.write_queue_size else 0
+                logger.info(f"[PROGRESS] Threads: {threads_alive} active | "
+                           f"Queues: raw={raw_pct}%, write={write_pct}% | "
+                           f"Segments: {self._stats.segments_downloaded}/{self._stats.segments_total}")
+
+            if threads_alive > 0:
+                logger.warning(f"[THREADS] {threads_alive} download threads still alive after {max_wait}s!")
+            else:
+                logger.info(f"[THREADS] All download threads done in {waited}s")
 
             # Signal decoders to finish (poison pills)
             logger.info("[SHUTDOWN] Sending poison pills to decoders...")
@@ -854,7 +875,26 @@ class TurboEngineV2:
                     continue
 
                 if pos + data_len <= file_size:
-                    if self.write_through:
+                    if self.ram_mode:
+                        # === RAM MODE: Write to BytesIO buffer ===
+                        # MUST use lock - BytesIO is not thread-safe for concurrent seek+write
+                        ram_file = handle[0]  # RamFile object
+
+                        # Debug: Log first segment write for each file (pos=0)
+                        if pos == 0:
+                            first_bytes = data[:16].hex() if len(data) >= 16 else data.hex()
+                            logger.debug(f"[RAM WRITE] file_idx={file_idx} pos=0 len={data_len} "
+                                        f"first_16={first_bytes} filename={ram_file.filename}")
+
+                        with self._file_locks[file_idx]:
+                            ram_file.data.seek(pos)
+                            ram_file.data.write(data)
+                            # Track actual bytes written (max position reached)
+                            ram_file.update_actual_size(pos, data_len)
+                        local_bytes += data_len
+                        local_segs += 1
+                        # No flush needed for RAM
+                    elif self.write_through:
                         # WriteThrough mode: direct file write (DyMaxIO compatible)
                         f = handle[0]
                         with self._file_locks[file_idx]:
@@ -1037,7 +1077,7 @@ class TurboEngineV2:
         return files
 
     def _prepare_file(self, nzb_file: NZBFile) -> None:
-        """Prepare output file for writing."""
+        """Prepare output file for writing (disk or RAM mode)."""
         try:
             # Handle empty filename
             if not nzb_file.filename or not nzb_file.filename.strip():
@@ -1046,6 +1086,26 @@ class TurboEngineV2:
             else:
                 safe_name = "".join(c if c.isalnum() or c in '.-_' else '_'
                                    for c in nzb_file.filename)
+
+            # === RAM MODE: Store in memory instead of disk ===
+            if self.ram_mode and self.ram_buffer is not None:
+                # Use unique key with file index to avoid collisions when NZB has duplicate names
+                # (common with obfuscated releases where all files have same subject)
+                ram_key = f"{safe_name}__idx{nzb_file.index:04d}"
+
+                # Store filename for later (original name without index suffix)
+                self._file_paths[nzb_file.index] = Path(safe_name)  # Virtual path (just the name)
+
+                # Create RAM buffer for this file with unique key
+                # Pass safe_name as display_name so ram_file.filename has the clean name
+                ram_file = self.ram_buffer.create_file(ram_key, max(nzb_file.size, 1), display_name=safe_name)
+                if ram_file:
+                    # Store reference: [ram_file, ram_key, size, write_count]
+                    self._file_handles[nzb_file.index] = [ram_file, ram_key, nzb_file.size, 0]
+                    self._file_locks[nzb_file.index] = threading.Lock()
+                else:
+                    logger.error(f"[RAM] Failed to create buffer for {ram_key}")
+                return  # Skip disk file creation
 
             # Ensure safe_name is not empty after sanitization
             if not safe_name or not safe_name.strip():
@@ -1152,7 +1212,12 @@ class TurboEngineV2:
         if file_idx in self._file_handles:
             handle = self._file_handles[file_idx]
             try:
-                if self.write_through:
+                if self.ram_mode:
+                    # RAM mode: no disk operations needed
+                    # Data stays in RamBuffer, just clean up tracking
+                    ram_file = handle[0]
+                    logger.debug(f"[FINALIZE-RAM] File complete: {ram_file.filename} ({ram_file.size} bytes)")
+                elif self.write_through:
                     # WriteThrough mode: just close file handle
                     f = handle[0]
                     f.flush()
@@ -1212,26 +1277,65 @@ class TurboEngineV2:
                 # Clean the real filename
                 safe_name = "".join(c if c.isalnum() or c in '.-_() ' else '_'
                                    for c in yenc_name)
-                new_path = self.output_dir / safe_name
 
-                try:
-                    # Handle duplicate names
-                    if new_path.exists() and new_path != old_path:
-                        base = new_path.stem
-                        ext = new_path.suffix
-                        counter = 1
-                        while new_path.exists():
-                            new_path = self.output_dir / f"{base}_{counter}{ext}"
-                            counter += 1
+                if self.ram_mode and self.ram_buffer is not None:
+                    # RAM mode: update filename in RamBuffer
+                    try:
+                        # Get the actual RAM key from _file_handles (includes index suffix)
+                        if file_idx in self._file_handles:
+                            old_name = self._file_handles[file_idx][1]  # ram_key with index
+                        else:
+                            old_name = str(old_path)
+                        ram_file = self.ram_buffer.get_file(old_name)
+                        if ram_file:
+                            # Update the filename in place
+                            ram_file.filename = safe_name
+                            # Move to new key in the buffer dict
+                            self.ram_buffer._files[safe_name] = ram_file
+                            if old_name in self.ram_buffer._files:
+                                del self.ram_buffer._files[old_name]
+                            # Update both references
+                            self._file_paths[file_idx] = Path(safe_name)
+                            self._file_handles[file_idx][1] = safe_name  # Update handle reference
+                            logger.info(f"Renamed (RAM): {old_name} -> {safe_name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to rename in RAM {old_path}: {e}")
+                else:
+                    # Disk mode: rename file on filesystem
+                    new_path = self.output_dir / safe_name
+                    try:
+                        # Handle duplicate names
+                        if new_path.exists() and new_path != old_path:
+                            base = new_path.stem
+                            ext = new_path.suffix
+                            counter = 1
+                            while new_path.exists():
+                                new_path = self.output_dir / f"{base}_{counter}{ext}"
+                                counter += 1
 
-                    if old_path.exists():
-                        old_path.rename(new_path)
-                        self._file_paths[file_idx] = new_path
-                        logger.info(f"Renamed: {old_path.name} -> {new_path.name}")
-                except Exception as e:
-                    logger.warning(f"Failed to rename {old_path.name}: {e}")
+                        if old_path.exists():
+                            old_path.rename(new_path)
+                            self._file_paths[file_idx] = new_path
+                            logger.info(f"Renamed: {old_path.name} -> {new_path.name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to rename {old_path.name}: {e}")
 
         self._stats.files_completed += 1
+
+        # === STREAMING POST-PROCESSING CALLBACK ===
+        # Notify listeners that a file is complete (for early PAR2 verification)
+        if self.on_file_complete:
+            try:
+                file_path = self._file_paths.get(file_idx)
+                if self.ram_mode:
+                    # RAM mode: pass virtual path (filename only)
+                    if file_path:
+                        self.on_file_complete(file_path, nzb_file.filename)
+                elif file_path and file_path.exists():
+                    # Disk mode: pass real path
+                    self.on_file_complete(file_path, nzb_file.filename)
+            except Exception as e:
+                logger.debug(f"on_file_complete callback error: {e}")
 
     def close(self) -> None:
         """Clean up."""
