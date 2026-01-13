@@ -79,6 +79,9 @@ class TurboConfig:
     writer_threads: int = 8
     pipeline_depth: int = 20
     write_through: bool = False  # DyMaxIO compatibility mode
+    # Queue sizes for buffering (larger = more RAM but smoother download)
+    raw_queue_size: int = 16000    # ~12 GB buffer (16000 × 750KB)
+    write_queue_size: int = 8000   # ~6 GB buffer (8000 × 750KB)
 
 
 @dataclass
@@ -102,6 +105,21 @@ class PostProcessConfig:
 
 
 @dataclass
+class RamProcessingConfig:
+    """RAM-based processing for ultra-fast post-processing.
+
+    When enabled, files are kept in RAM during download and processing,
+    minimizing disk I/O. GPU acceleration uses CUDA for Reed-Solomon repair.
+    """
+    enabled: bool = False                  # Enable RAM-based processing
+    max_size_mb: int = 32768               # Max total size for RAM processing (32 GB default)
+    gpu_repair: bool = True                # Use GPU for Reed-Solomon repair
+    gpu_device_id: int = 0                 # CUDA device ID (0 = first GPU)
+    verify_threads: int = 0                # MD5 verification threads (0 = auto)
+    flush_buffer_mb: int = 256             # Buffer size when flushing to disk
+
+
+@dataclass
 class Config:
     """Main configuration container."""
     server: ServerConfig = field(default_factory=ServerConfig)
@@ -110,7 +128,8 @@ class Config:
     ui: UIConfig = field(default_factory=UIConfig)
     turbo: TurboConfig = field(default_factory=TurboConfig)
     postprocess: PostProcessConfig = field(default_factory=PostProcessConfig)
-    version: str = "1.0.2"
+    ram_processing: RamProcessingConfig = field(default_factory=RamProcessingConfig)
+    version: str = "1.1.1"
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -126,6 +145,7 @@ class Config:
             ui=UIConfig(**data.get("ui", {})),
             turbo=TurboConfig(**data.get("turbo", {})),
             postprocess=PostProcessConfig(**data.get("postprocess", {})),
+            ram_processing=RamProcessingConfig(**data.get("ram_processing", {})),
             version=data.get("version", "1.0.0")
         )
 
@@ -158,6 +178,16 @@ class Config:
 
         if self.postprocess.parallel_move_threads < 1 or self.postprocess.parallel_move_threads > 32:
             errors.append("Parallel move threads must be between 1 and 32")
+
+        # RAM processing validation
+        if self.ram_processing.max_size_mb < 1024:
+            errors.append("RAM processing max size must be at least 1024 MB (1 GB)")
+
+        if self.ram_processing.max_size_mb > 131072:  # 128 GB max
+            errors.append("RAM processing max size cannot exceed 131072 MB (128 GB)")
+
+        if self.ram_processing.flush_buffer_mb < 64 or self.ram_processing.flush_buffer_mb > 4096:
+            errors.append("Flush buffer must be between 64 and 4096 MB")
 
         return errors
 
