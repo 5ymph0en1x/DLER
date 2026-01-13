@@ -27,6 +27,7 @@ Target: Debit maximal 10 Gbps avec RAM controlee
 
 import os
 import sys
+import re
 import mmap
 import time
 import logging
@@ -326,6 +327,7 @@ class TurboEngineV2:
 
         # Connections
         self._connections: List[NNTPConnection] = []
+        self._needs_reconnect = False  # Force reconnect on next download
 
         # Decoder
         self._decoder = TurboYEncDecoder()
@@ -437,7 +439,26 @@ class TurboEngineV2:
 
     def download_nzb(self, nzb_path: Path) -> bool:
         """Download all files from NZB."""
+        # Check if we need to (re)connect
+        # Connections may be stale from a previous download
+        need_reconnect = self._needs_reconnect
+
         if not self._connections:
+            need_reconnect = True
+        elif not need_reconnect:
+            # Check if existing connections are still alive
+            alive_count = sum(1 for c in self._connections if c and c.connected and c.socket)
+            if alive_count < len(self._connections) // 2:
+                # More than half dead, reconnect all
+                logger.info(f"[CONNECT] Only {alive_count}/{len(self._connections)} connections alive, reconnecting...")
+                need_reconnect = True
+
+        if need_reconnect:
+            # Disconnect any stale connections first
+            if self._connections:
+                logger.info("[CONNECT] Reconnecting (previous session ended)...")
+                self.disconnect()
+            self._needs_reconnect = False
             if self.connect() == 0:
                 return False
 
@@ -628,11 +649,16 @@ class TurboEngineV2:
             success = success_rate >= 0.95  # 95% threshold
             logger.info(f"[STATS] Success rate: {success_rate*100:.1f}%, returning {success}")
 
+            # Mark that connections should be refreshed for next download
+            # (servers often close idle connections between downloads)
+            self._needs_reconnect = True
+
             return success
 
         except KeyboardInterrupt:
             print("\n\nCancelled by user")
             self._running = False
+            self._needs_reconnect = True
             return False
 
     def _download_worker(
@@ -1039,10 +1065,17 @@ class TurboEngineV2:
                         # Quotes but empty/invalid filename = obfuscated
                         obfuscated = True
                 else:
-                    # No quotes in subject = likely obfuscated
-                    # Check if subject looks like random string (no spaces, no extension)
-                    if ' ' not in subject and '.' not in subject and len(subject) > 10:
-                        obfuscated = True
+                    # No quotes in subject - try to extract filename
+                    # First, strip common part number patterns: (1/0), (01/10), [1/5], etc.
+                    cleaned = re.sub(r'\s*[\(\[]\d+/\d+[\)\]]\s*$', '', subject).strip()
+                    if cleaned:
+                        filename = cleaned
+
+                    # Check if remaining looks like random string (no extension)
+                    if '.' not in filename or (len(filename) > 20 and ' ' not in filename):
+                        # Might be obfuscated, but still use what we have
+                        if ' ' not in subject and '.' not in subject and len(subject) > 10:
+                            obfuscated = True
 
                 segments = []
                 total_bytes = 0
