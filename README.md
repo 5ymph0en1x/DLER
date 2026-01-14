@@ -54,7 +54,7 @@ High-performance NZB downloader engineered for **maximum throughput** on modern 
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐   │
-│  │  NNTP    │───▶│  Decode  │───▶│  Write   │───▶│  Verify  │   │
+│  │  NNTP    │───>│  Decode  │───>│  Write   │───>│  Verify  │   │
 │  │ Threads  │    │ Threads  │    │ Threads  │    │ (PAR2)   │   │
 │  │  (50+)   │    │ (CPU//2) │    │   (8)    │    │          │   │
 │  └──────────┘    └──────────┘    └──────────┘    └──────────┘   │
@@ -75,7 +75,7 @@ High-performance NZB downloader engineered for **maximum throughput** on modern 
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐                   │
-│  │  NNTP    │───▶│  Decode  │───▶│   RAM    │                   │
+│  │  NNTP    │───>│  Decode  │───>│   RAM    │                   │
 │  │ Download │    │  (AVX2)  │    │  Buffer  │                   │
 │  │  (30+)   │    │   (24)   │    │ (BytesIO)│                   │
 │  └──────────┘    └──────────┘    └──────────┘                   │
@@ -83,7 +83,7 @@ High-performance NZB downloader engineered for **maximum throughput** on modern 
 │                  ┌─────────────────────┘                        │
 │                  ▼                                              │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐                   │
-│  │  PAR2    │───▶│ Extract  │───▶│  Flush   │                   │
+│  │  PAR2    │───>│ Extract  │───>│  Flush   │                   │
 │  │  Verify  │    │   (7z)   │    │ to Disk  │                   │
 │  │  (MD5)   │    │          │    │          │                   │
 │  └──────────┘    └──────────┘    └──────────┘                   │
