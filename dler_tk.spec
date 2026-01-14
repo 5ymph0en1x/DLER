@@ -48,6 +48,8 @@ base_hiddenimports = [
     'src.core.fast_nntp',
     'src.core.post_processor',
     'src.core.ram_processor',
+    'src.core.par2_database',
+    'src.core.file_verification',
     'src.utils.config',
     'yenc_turbo',
     # NumPy (required for both)
