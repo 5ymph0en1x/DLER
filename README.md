@@ -7,7 +7,7 @@
 High-performance NZB downloader engineered for **maximum throughput** on modern hardware. Built for users who want simplicity without sacrificing speed.
 
 <div align="center">
-    <img src="screenshots/gui.jpg" alt="DLER Screenshot">
+    <img src="screenshots/gui2.jpg" alt="DLER Screenshot">
 </div>
 
 ## Why DLER?
