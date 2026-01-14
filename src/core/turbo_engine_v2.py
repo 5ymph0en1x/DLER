@@ -55,6 +55,18 @@ except ImportError:
     HAS_RAM_PROCESSOR = False
     RamBuffer = None  # Type hint placeholder
 
+# Incremental verification support
+try:
+    from .par2_database import Par2FileDatabase, FileVerificationStatus
+    from .file_verification import FileVerificationQueue, FileVerificationResult
+    HAS_VERIFICATION = True
+except ImportError:
+    HAS_VERIFICATION = False
+    Par2FileDatabase = None
+    FileVerificationStatus = None
+    FileVerificationQueue = None
+    FileVerificationResult = None
+
 def get_process_memory_mb() -> float:
     """Get current process memory usage in MB."""
     if HAS_PSUTIL:
@@ -308,7 +320,8 @@ class TurboEngineV2:
         on_file_complete: Optional[Callable[[Path, str], None]] = None,  # Streaming PAR2 callback
         ram_buffer: Optional['RamBuffer'] = None,  # RAM-based storage (no disk writes)
         raw_queue_size: int = 16000,   # ~12 GB buffer for raw data
-        write_queue_size: int = 8000   # ~6 GB buffer for decoded data
+        write_queue_size: int = 8000,  # ~6 GB buffer for decoded data
+        incremental_verify: bool = True  # Enable incremental PAR2 verification
     ):
         self.server_config = server_config
         self.output_dir = Path(output_dir)
@@ -324,6 +337,12 @@ class TurboEngineV2:
         self.ram_mode = ram_buffer is not None
         self.raw_queue_size = raw_queue_size
         self.write_queue_size = write_queue_size
+        self.incremental_verify = incremental_verify
+
+        # Incremental verification state
+        self._par2_db: Optional['Par2FileDatabase'] = None
+        self._verify_queue: Optional['FileVerificationQueue'] = None
+        self._verification_enabled = False
 
         # Connections
         self._connections: List[NNTPConnection] = []
@@ -432,7 +451,7 @@ class TurboEngineV2:
             try:
                 if conn and conn.socket:
                     conn.socket.close()
-            except:
+            except Exception:
                 pass
         self._connections.clear()
         print("[ENGINE] Disconnected")
@@ -485,6 +504,46 @@ class TurboEngineV2:
         self._used_filenames.clear()
         self._renamed_files.clear()
         self._file_paths.clear()
+
+        # === INCREMENTAL VERIFICATION SETUP ===
+        # Initialize PAR2 database and verification queue if enabled
+        self._verification_enabled = False
+        self._par2_db = None
+        self._verify_queue = None
+
+        if self.incremental_verify and HAS_VERIFICATION and not self.ram_mode:
+            try:
+                # Find PAR2 files in the NZB (case-insensitive)
+                par2_files = [f for f in files if f.filename.lower().endswith('.par2')]
+                if par2_files:
+                    # Find main .par2 file (not .vol*.par2)
+                    main_par2 = None
+                    for pf in par2_files:
+                        fname_lower = pf.filename.lower()
+                        if fname_lower.endswith('.par2') and '.vol' not in fname_lower:
+                            main_par2 = pf
+                            break
+
+                    if main_par2:
+                        logger.info(f"[VERIFY] Found {len(par2_files)} PAR2 files, main: {main_par2.filename}")
+                        # Initialize database and queue
+                        self._par2_db = Par2FileDatabase()
+                        # Use 4 verification threads (disk I/O bound)
+                        verify_threads = min(4, max(1, self.writer_threads // 2))
+                        self._verify_queue = FileVerificationQueue(
+                            output_dir=self.output_dir,
+                            on_result=self._on_verification_result,
+                            threads=verify_threads
+                        )
+                        self._verification_enabled = True
+                        logger.info(f"[VERIFY] Incremental verification enabled with {verify_threads} threads")
+                    else:
+                        logger.info("[VERIFY] No main PAR2 file found, verification disabled")
+                else:
+                    logger.info("[VERIFY] No PAR2 files in NZB, verification disabled")
+            except Exception as e:
+                logger.warning(f"[VERIFY] Failed to initialize verification: {e}")
+                self._verification_enabled = False
 
         logger.info(f"[DOWNLOAD] Starting: {len(files)} files, {self._stats.segments_total} segments")
         logger.info(f"[DOWNLOAD] Pipeline: {len(self._connections)} connections, "
@@ -637,6 +696,48 @@ class TurboEngineV2:
             self._file_progress.clear()
             self._file_info.clear()
 
+            # === WAIT FOR VERIFICATION COMPLETION ===
+            verification_results = []
+            if self._verification_enabled and self._verify_queue is not None:
+                try:
+                    logger.info("[VERIFY] Waiting for pending verifications...")
+                    verification_results = self._verify_queue.wait_for_all(timeout=300)
+
+                    # Log verification summary
+                    verified_count = sum(1 for r in verification_results if r.status == FileVerificationStatus.VERIFIED)
+                    damaged_count = sum(1 for r in verification_results if r.status == FileVerificationStatus.DAMAGED)
+                    skipped_count = sum(1 for r in verification_results if r.status == FileVerificationStatus.SKIPPED)
+                    error_count = sum(1 for r in verification_results if r.status == FileVerificationStatus.ERROR)
+
+                    logger.info(f"[VERIFY] Summary: verified={verified_count}, damaged={damaged_count}, "
+                               f"skipped={skipped_count}, errors={error_count}")
+
+                    if damaged_count > 0:
+                        logger.warning(f"[VERIFY] {damaged_count} file(s) failed verification - may need PAR2 repair")
+                        for r in verification_results:
+                            if r.status == FileVerificationStatus.DAMAGED:
+                                logger.warning(f"[VERIFY]   - {r.filename}")
+
+                except Exception as e:
+                    logger.error(f"[VERIFY] Error waiting for verifications: {e}")
+
+            # === CLEANUP VERIFICATION RESOURCES ===
+            if self._verify_queue is not None:
+                try:
+                    self._verify_queue.shutdown(wait=False)
+                except Exception as e:
+                    logger.debug(f"[VERIFY] Cleanup error: {e}")
+                self._verify_queue = None
+
+            if self._par2_db is not None:
+                try:
+                    self._par2_db.clear()
+                except Exception as e:
+                    logger.debug(f"[VERIFY] DB cleanup error: {e}")
+                self._par2_db = None
+
+            self._verification_enabled = False
+
             # Final stats
             logger.info(f"[STATS] Downloaded: {self._stats.segments_downloaded}/{self._stats.segments_total}")
             logger.info(f"[STATS] Decoded: {self._stats.segments_decoded}")
@@ -659,6 +760,20 @@ class TurboEngineV2:
             print("\n\nCancelled by user")
             self._running = False
             self._needs_reconnect = True
+            # Cleanup verification resources on cancel
+            if self._verify_queue is not None:
+                try:
+                    self._verify_queue.shutdown(wait=False)
+                except Exception:
+                    pass
+                self._verify_queue = None
+            if self._par2_db is not None:
+                try:
+                    self._par2_db.clear()
+                except Exception:
+                    pass
+                self._par2_db = None
+            self._verification_enabled = False
             return False
 
     def _download_worker(
@@ -1262,8 +1377,8 @@ class TurboEngineV2:
                         mm.flush()
                         mm.close()
                     os.close(fd)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Error closing file handle: {e}")
             del self._file_handles[file_idx]
 
         # === RENAME OBFUSCATED FILE TO REAL NAME ===
@@ -1369,6 +1484,54 @@ class TurboEngineV2:
                     self.on_file_complete(file_path, nzb_file.filename)
             except Exception as e:
                 logger.debug(f"on_file_complete callback error: {e}")
+
+        # === INCREMENTAL VERIFICATION ===
+        # Queue completed file for verification if enabled
+        # Note: Check _verify_queue is not None to prevent race conditions during cleanup
+        if self._verification_enabled and self._par2_db is not None and self._verify_queue is not None:
+            try:
+                file_path = self._file_paths.get(file_idx)
+                if file_path:
+                    filename_lower = nzb_file.filename.lower()
+                    is_par2 = filename_lower.endswith('.par2')
+
+                    if is_par2:
+                        # Register PAR2 file in database
+                        if file_path.exists():
+                            try:
+                                self._par2_db.register_par2_file(file_path)
+                                logger.debug(f"[VERIFY] Registered PAR2: {file_path.name}")
+                            except Exception as e:
+                                logger.warning(f"[VERIFY] Failed to register PAR2 {file_path.name}: {e}")
+                    else:
+                        # Queue non-PAR2 file for verification
+                        if file_path.exists():
+                            # Look up PAR2 entry for this file
+                            par2_entry = self._par2_db.get_entry_by_filename(
+                                file_path.name,
+                                actual_filename=nzb_file.filename
+                            )
+                            self._verify_queue.queue_file_for_verification(
+                                file_path=file_path,
+                                par2_entry=par2_entry,
+                                original_filename=nzb_file.filename
+                            )
+                            pending = self._verify_queue.get_pending_count()
+                            completed = self._verify_queue.get_completed_count()
+                            logger.debug(f"[VERIFY] Queued: {file_path.name} (pending={pending}, completed={completed})")
+            except Exception as e:
+                logger.warning(f"[VERIFY] Error queueing {nzb_file.filename}: {e}")
+
+    def _on_verification_result(self, result: 'FileVerificationResult') -> None:
+        """Callback for verification results."""
+        if result.status == FileVerificationStatus.VERIFIED:
+            logger.info(f"[VERIFY] OK: {result.filename}")
+        elif result.status == FileVerificationStatus.DAMAGED:
+            logger.warning(f"[VERIFY] DAMAGED: {result.filename} (expected={result.md5_expected}, got={result.md5_computed})")
+        elif result.status == FileVerificationStatus.ERROR:
+            logger.error(f"[VERIFY] ERROR: {result.filename} - {result.error}")
+        else:
+            logger.debug(f"[VERIFY] {result.status.name}: {result.filename}")
 
     def close(self) -> None:
         """Clean up."""
