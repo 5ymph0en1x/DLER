@@ -177,7 +177,7 @@ python setup.py build_ext --inplace
 cd ../..
 
 # (Optional) Install CuPy for GPU acceleration
-pip install cupy-cuda13x
+pip install cupy-cuda13x --pre -U -f https://pip.cupy.dev/pre --no-binary cupy -v
 
 # Run
 python tk_main.py
