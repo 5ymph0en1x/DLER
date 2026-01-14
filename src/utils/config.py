@@ -129,7 +129,7 @@ class Config:
     turbo: TurboConfig = field(default_factory=TurboConfig)
     postprocess: PostProcessConfig = field(default_factory=PostProcessConfig)
     ram_processing: RamProcessingConfig = field(default_factory=RamProcessingConfig)
-    version: str = "1.1.1"
+    version: str = "1.1.2"
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""
