@@ -293,7 +293,7 @@ Your CPU doesn't support AVX2. DLER will use the Python fallback decoder (still 
 GPU acceleration requires:
 - NVIDIA GPU with CUDA support
 - CUDA 13.x toolkit installed
-- CuPy package (`pip install cupy-cuda13x`)
+- CuPy package (`pip install cupy-cuda13x --pre -U -f https://pip.cupy.dev/pre --no-binary cupy -v`)
 
 DLER will fall back to CPU-based processing if CuPy is unavailable.
 
