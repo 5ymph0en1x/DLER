@@ -56,17 +56,27 @@ def main() -> int:
     logger = logging.getLogger(__name__)
     logger.info("DLER TKinter starting...")
 
+    # Check for --minimized command line argument
+    start_minimized = '--minimized' in sys.argv
+
     try:
         # Ensure config directories exist
         from src.utils.config import load_config, ensure_directories
         config = load_config()
         ensure_directories(config)
 
+        # Also check config for start_minimized setting
+        if config.ui.start_minimized and not start_minimized:
+            start_minimized = True
+            logger.info("Starting minimized (from config)")
+        elif start_minimized:
+            logger.info("Starting minimized (from command line)")
+
         logger.info("Configuration loaded, launching TKinter GUI...")
 
         # Import and run TKinter app
         from src.gui.tkinter_app import DLERApp
-        app = DLERApp()
+        app = DLERApp(start_minimized=start_minimized)
         app.run()
 
         return 0

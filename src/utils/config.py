@@ -70,6 +70,11 @@ class UIConfig:
     show_speed_graph: bool = True
     show_connections: bool = True
     compact_mode: bool = False
+    show_completion_summary: bool = False  # Show completion popup after download
+    # System tray settings
+    minimize_to_tray: bool = False       # Minimize to tray instead of closing
+    start_minimized: bool = False       # Start minimized in system tray
+    start_with_windows: bool = False    # Auto-start with Windows
 
 
 @dataclass

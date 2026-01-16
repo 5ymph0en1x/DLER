@@ -7,7 +7,7 @@
 High-performance NZB downloader engineered for **maximum throughput** on modern hardware. Built for users who want simplicity without sacrificing speed.
 
 <div align="center">
-    <img src="screenshots/gui3.jpg" alt="DLER Screenshot">
+    <img src="screenshots/gui.jpg" alt="DLER Screenshot">
 </div>
 
 ## Why DLER?
@@ -54,7 +54,7 @@ High-performance NZB downloader engineered for **maximum throughput** on modern 
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐   │
-│  │  NNTP    │───>│  Decode  │───>│  Write   │───>│  Verify  │   │
+│  │  NNTP    │───▶│  Decode  │───▶│  Write   │───▶│  Verify  │   │
 │  │ Threads  │    │ Threads  │    │ Threads  │    │ (PAR2)   │   │
 │  │  (50+)   │    │ (CPU//2) │    │   (8)    │    │          │   │
 │  └──────────┘    └──────────┘    └──────────┘    └──────────┘   │
@@ -75,7 +75,7 @@ High-performance NZB downloader engineered for **maximum throughput** on modern 
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐                   │
-│  │  NNTP    │───>│  Decode  │───>│   RAM    │                   │
+│  │  NNTP    │───▶│  Decode  │───▶│   RAM    │                   │
 │  │ Download │    │  (AVX2)  │    │  Buffer  │                   │
 │  │  (30+)   │    │   (24)   │    │ (BytesIO)│                   │
 │  └──────────┘    └──────────┘    └──────────┘                   │
@@ -83,7 +83,7 @@ High-performance NZB downloader engineered for **maximum throughput** on modern 
 │                  ┌─────────────────────┘                        │
 │                  ▼                                              │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐                   │
-│  │  PAR2    │───>│ Extract  │───>│  Flush   │                   │
+│  │  PAR2    │───▶│ Extract  │───▶│  Flush   │                   │
 │  │  Verify  │    │   (7z)   │    │ to Disk  │                   │
 │  │  (MD5)   │    │          │    │          │                   │
 │  └──────────┘    └──────────┘    └──────────┘                   │
@@ -146,8 +146,8 @@ Supports standard NNTPS ports: **563** (default), **443**
 ### From Release (Recommended)
 
 Download from [Releases](https://github.com/5ymph0en1x/DLER/releases):
-- `DLER_v1.1.2.exe` - Ultimate edition with CUDA support
-- `DLER_Basic_v1.1.2.exe` - Lightweight CPU-only edition
+- `DLER_v1.2.0.exe` - Ultimate edition with CUDA support
+- `DLER_Basic_v1.2.0.exe` - Lightweight CPU-only edition
 
 No installation required - standalone executables.
 
@@ -306,6 +306,12 @@ DLER will fall back to CPU-based processing if CuPy is unavailable.
 
 ## Changelog
 
+### v1.2.0 (2026-01-16)
+- **Fixed:** Multi-volume RAR extraction with encrypted headers now works correctly
+- **Fixed:** Password from NZB metadata properly used for all extraction stages
+- **Fixed:** Duplicate folder issue (Release.Name/Release.Name/) automatically corrected
+- **Improved:** Pre-sorted volume order for encrypted archives (uses NZB buffer index)
+
 ### v1.1.2 (2026-01-14)
 - **New:** Incremental PAR2 verification - verifies files as they complete downloading
 - **New:** Early damage detection - know if repair is needed before download finishes
@@ -354,5 +360,5 @@ Contributions welcome! Please:
 ---
 
 <div align="center">
-    <strong>DLER v1.1.2</strong> - Download at wire speed.
+    <strong>DLER v1.2.0</strong> - Download at wire speed.
 </div>

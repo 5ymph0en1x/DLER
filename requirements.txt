@@ -1,18 +1,28 @@
-# DLER - High-Performance NZB Downloader
-# Core dependencies
+# DLER v1.2.0 - High-Performance NZB Downloader
+# Requirements for full functionality
 
-aiofiles>=23.2.1
-rich>=13.7.0
-textual>=0.47.0
-lxml>=5.1.0
-msgpack>=1.0.7
-orjson>=3.9.0
-numpy>=1.26.0
-diskcache>=5.6.0
+# === Core Dependencies ===
+lxml>=5.1.0              # NZB parsing
+pycryptodomex>=3.20.0    # SSL/encryption
+psutil>=5.9.0            # System monitoring
 
-# TKinter Modern Themes (Marantz-style GUI)
-TKinterModernThemes>=1.10.0
+# === GUI ===
+TKinterModernThemes>=1.10.0  # Modern tkinter themes
+Pillow>=10.0.0               # Image handling for GUI
+tkinterdnd2>=0.4.2           # Drag-and-drop support for NZB files (cross-platform)
 
-# Development dependencies
-pytest>=8.0.0
-pytest-asyncio>=0.23.0
+# === Performance ===
+numpy>=2.0.0             # Numerical operations
+orjson>=3.9.0            # Fast JSON parsing
+
+# === Archive Handling ===
+py7zr>=0.22.0            # 7z archive support (in-memory)
+
+# === Development ===
+pytest>=8.0.0            # Testing
+pyinstaller>=6.0.0       # Executable building
+
+# === Notes ===
+# - For GPU support: Install CUDA 13.x toolkit first
+# - Native yEnc decoder (yenc_turbo.pyd) provides 3+ GB/s decoding
+# - Python 3.14+ recommended for best performance

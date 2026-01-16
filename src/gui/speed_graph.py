@@ -27,21 +27,21 @@ class SpeedGraphWidget(tk.Canvas):
     """
 
     # Colors matching DLER dark theme (park dark)
-    BG_COLOR = "#252525"
-    GRID_COLOR = "#323232"
+    BG_COLOR = "#2b2b2b"          # Match interface background
+    GRID_COLOR = "#383838"        # Subtle grid lines
     LINE_COLOR = "#217346"        # Forest green
     LINE_GLOW = "#1a5c38"         # Darker green for glow
     TEXT_COLOR = "#808080"
     ACCENT_COLOR = "#2d9254"      # Lighter green for current speed
 
-    # Gradient fill colors (subtle)
+    # Gradient fill colors (subtle, blending with interface)
     FILL_COLORS = [
-        "#1a1f1a",  # Bottom - almost black
-        "#1c241c",
-        "#1e291e",
-        "#202e20",
-        "#223322",
-        "#243824",  # Top - subtle green
+        "#1f251f",  # Bottom - dark with hint of green
+        "#212721",
+        "#232923",
+        "#252b25",
+        "#273027",
+        "#293529",  # Top - subtle green
     ]
 
     def __init__(
@@ -75,11 +75,11 @@ class SpeedGraphWidget(tk.Canvas):
         self._max_speed_seen: float = 10.0
         self._display_max: float = 10.0  # Smoothed display max
 
-        # Compact margins to maximize graph area
-        self._margin_left = 32
-        self._margin_right = 58  # Space for speed indicator
-        self._margin_top = 4
-        self._margin_bottom = 12
+        # Haute couture margins - maximized graph area
+        self._margin_left = 26    # Just enough for "999M" labels
+        self._margin_right = 50   # Compact speed indicator space
+        self._margin_top = 2      # Minimal top breathing room
+        self._margin_bottom = 8   # Reduced bottom spacing
 
         # Pre-compute graph area
         self._graph_x0 = self._margin_left
@@ -274,22 +274,22 @@ class SpeedGraphWidget(tk.Canvas):
         max_label = self._format_compact(self._display_max)
 
         self.create_text(
-            self._graph_x0 - 3, self._graph_y0,
+            self._graph_x0 - 2, self._graph_y0 + 1,
             text=max_label, anchor="e",
             fill=self.TEXT_COLOR, font=("Consolas", 7)
         )
         self.create_text(
-            self._graph_x0 - 3, self._graph_y1,
+            self._graph_x0 - 2, self._graph_y1 - 1,
             text="0", anchor="e",
             fill=self.TEXT_COLOR, font=("Consolas", 7)
         )
 
-        # Current speed (right side)
+        # Current speed (right side, vertically centered in margin)
         speed_text = self._format_speed(self._ema_speed)
         self.create_text(
-            self._width - 4, self._graph_y0 + 8,
+            self._width - 3, self._graph_y0 + 6,
             text=speed_text, anchor="e",
-            fill=self.ACCENT_COLOR, font=("Consolas", 10, "bold")
+            fill=self.ACCENT_COLOR, font=("Consolas", 9, "bold")
         )
 
     def _speed_to_y(self, speed: float) -> float:

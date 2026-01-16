@@ -30,7 +30,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional, List, Dict, Callable, Tuple, Set
 from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from enum import Enum
 import time
 
@@ -101,22 +102,29 @@ def _normalize_filename(filename: str) -> str:
     return normalized
 
 
-def quick_nzb_analysis(nzb_path: Path) -> Tuple[str, bool]:
+def quick_nzb_analysis(nzb_path: Path) -> Tuple[str, bool, bool]:
     """
-    Quickly analyze NZB to determine title and if it contains archives.
+    Quickly analyze NZB to determine title, archives presence, and obfuscation.
 
     This is a lightweight function for deciding download destination
     BEFORE starting the download.
+
+    IMPORTANT: For obfuscated NZBs, subject lines don't contain real filenames.
+    We default to has_archives=True (safer) unless we're CERTAIN there are no archives.
 
     Args:
         nzb_path: Path to NZB file
 
     Returns:
-        (title, has_archives) tuple
+        (title, has_archives, is_obfuscated) tuple
     """
     title = nzb_path.stem
-    has_archives = False
+    has_archives = True  # Default to True (safer for obfuscated NZBs)
     archive_patterns = {'.rar', '.zip', '.7z', '.tar', '.gz'}
+    media_patterns = {'.mkv', '.avi', '.mp4', '.m2ts', '.ts', '.iso', '.img'}
+    found_clear_media = False
+    found_clear_archives = False
+    is_obfuscated = False
 
     try:
         tree = ET.parse(nzb_path)
@@ -134,30 +142,51 @@ def quick_nzb_analysis(nzb_path: Path) -> Tuple[str, bool]:
                     title = meta.text.strip()
                     break
 
-        # Check file subjects for archive extensions
+        # Check file subjects for archive/media extensions
         file_elements = root.findall('.//nzb:file', ns) or root.findall('.//file')
 
         for file_elem in file_elements:
             subject = file_elem.get('subject', '').lower()
+
+            # Detect obfuscation: subject has no recognizable extension
+            has_extension = any(ext in subject for ext in archive_patterns | media_patterns | {'.par2', '.nfo', '.sfv'})
+            if not has_extension and subject and len(subject) > 10:
+                # Subject looks like random string without extension = likely obfuscated
+                is_obfuscated = True
+
             # Check for archive extensions in subject
             if any(ext in subject for ext in archive_patterns):
-                has_archives = True
-                break
+                found_clear_archives = True
             # Check for RAR split pattern
             if re.search(r'\.r\d{2}', subject):
-                has_archives = True
-                break
+                found_clear_archives = True
             if '.part' in subject and '.rar' in subject:
-                has_archives = True
-                break
+                found_clear_archives = True
 
-        logger.debug(f"Quick NZB analysis: title={title}, has_archives={has_archives}")
+            # Check for media files (no archives needed)
+            if any(ext in subject for ext in media_patterns):
+                found_clear_media = True
+
+        # Decision logic:
+        # - If we found clear archives -> has_archives = True
+        # - If we found ONLY media files (no archives) -> has_archives = False
+        # - If obfuscated (can't tell) -> has_archives = True (safer default)
+        if found_clear_archives:
+            has_archives = True
+        elif found_clear_media and not is_obfuscated:
+            has_archives = False
+        else:
+            # Can't determine (obfuscated or unclear) -> assume archives (safer)
+            has_archives = True
+
+        logger.debug(f"Quick NZB analysis: title={title}, has_archives={has_archives}, obfuscated={is_obfuscated}")
 
     except Exception as e:
         logger.warning(f"Quick NZB analysis failed: {e}, assuming has_archives=True")
         has_archives = True  # Safe default: use temp dir
+        is_obfuscated = True  # Assume obfuscated when analysis fails
 
-    return title, has_archives
+    return title, has_archives, is_obfuscated
 
 
 class PostProcessStatus(Enum):
@@ -968,6 +997,478 @@ class StreamingPostProcessor:
             return self._completed_files.copy()
 
 
+class StreamingExtractor:
+    """
+    Start RAR extraction during download as soon as complete sets are detected.
+
+    Tracks RAR part completion and triggers extraction immediately when
+    all parts of a multi-part set are available. This overlaps extraction
+    with ongoing downloads for faster overall completion.
+
+    Usage:
+        extractor = StreamingExtractor(
+            download_dir=Path("downloads"),
+            extract_dir=Path("extracted"),
+            on_extraction_start=lambda name: print(f"Extracting: {name}"),
+            on_extraction_complete=lambda name, ok, n: print(f"Done: {name}")
+        )
+
+        # Register with download engine
+        engine.on_file_complete = extractor.on_file_complete
+
+        # After download, wait for pending extractions
+        extractor.wait_for_pending()
+    """
+
+    def __init__(
+        self,
+        download_dir: Path,
+        extract_dir: Path,
+        sevenzip_path: Optional[str] = None,
+        password: Optional[str] = None,
+        max_parallel: int = 2,
+        threads_per_extraction: int = 4,
+        on_extraction_start: Optional[Callable[[str], None]] = None,
+        on_extraction_complete: Optional[Callable[[str, bool, int], None]] = None
+    ):
+        """
+        Initialize streaming extractor.
+
+        Args:
+            download_dir: Directory where files are downloading
+            extract_dir: Destination for extracted files
+            sevenzip_path: Path to 7z executable (auto-detect if None)
+            password: Archive password
+            max_parallel: Max concurrent extractions during download (default: 2)
+            threads_per_extraction: Threads per 7z instance (default: 4)
+            on_extraction_start: Callback(archive_name) when extraction starts
+            on_extraction_complete: Callback(archive_name, success, files_count)
+        """
+        self.download_dir = Path(download_dir)
+        self.extract_dir = Path(extract_dir)
+        self.password = password
+        self.max_parallel = max_parallel
+        self.threads_per_extraction = threads_per_extraction
+        self.on_extraction_start = on_extraction_start
+        self.on_extraction_complete = on_extraction_complete
+
+        # Find 7z executable
+        self.sevenzip_path = sevenzip_path or self._find_sevenzip()
+
+        # State tracking
+        self._lock = threading.Lock()
+        self._completed_parts: Dict[str, Set[Path]] = defaultdict(set)  # base_name -> set of completed parts
+        self._expected_parts_cache: Dict[str, int] = {}  # base_name -> expected count (from NZB)
+        self._extracted_sets: Set[str] = set()  # Sets that have been extracted
+        self._extraction_results: List[Tuple[str, bool, int]] = []  # (name, success, files_count)
+
+        # Background extraction thread pool
+        self._extraction_executor = ThreadPoolExecutor(
+            max_workers=max_parallel,
+            thread_name_prefix="StreamExtract"
+        )
+        self._pending_futures: Dict[str, 'Future'] = {}
+
+        # Ensure extract directory exists
+        self.extract_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"StreamingExtractor initialized: max_parallel={max_parallel}, 7z={self.sevenzip_path or 'NOT FOUND'}")
+
+    def _find_sevenzip(self) -> Optional[str]:
+        """Find 7z executable."""
+        # Check bundled tools first
+        if hasattr(sys, '_MEIPASS'):
+            bundled = Path(sys._MEIPASS) / 'tools' / '7z.exe'
+        else:
+            bundled = Path(__file__).parent.parent.parent / 'tools' / '7z.exe'
+
+        if bundled.exists():
+            return str(bundled)
+
+        # Check common paths
+        paths = [
+            r"7z.exe",
+            r"C:\Program Files\7-Zip\7z.exe",
+            r"C:\Program Files (x86)\7-Zip\7z.exe",
+        ]
+
+        for path in paths:
+            if not os.path.isabs(path):
+                result = shutil.which(path)
+                if result:
+                    return result
+            elif Path(path).exists():
+                return path
+
+        return None
+
+    def set_expected_parts(self, rar_sets: Dict[str, int]) -> None:
+        """
+        Pre-set expected part counts from NZB analysis.
+
+        Args:
+            rar_sets: Dict mapping base_name to expected part count
+        """
+        with self._lock:
+            self._expected_parts_cache.update(rar_sets)
+            logger.debug(f"StreamingExtractor: set expected parts for {len(rar_sets)} RAR sets")
+
+    def _is_rar_part(self, filename: str) -> bool:
+        """Check if file is a RAR archive or part."""
+        name_lower = filename.lower()
+
+        # Standard patterns
+        if name_lower.endswith('.rar'):
+            return True
+
+        # Split RAR: .r00, .r01, etc.
+        if re.match(r'.*\.r\d{2,}$', name_lower):
+            return True
+
+        return False
+
+    def _get_rar_base_name(self, filename: str) -> str:
+        """
+        Extract base name from RAR filename.
+
+        Examples:
+            release.part01.rar -> release
+            release.rar -> release
+            release.r00 -> release
+        """
+        name_lower = filename.lower()
+
+        # Pattern: release.partXX.rar
+        match = re.match(r'^(.+)\.part\d+\.rar$', name_lower)
+        if match:
+            return match.group(1)
+
+        # Pattern: release.rar or release.rXX
+        match = re.match(r'^(.+)\.(rar|r\d{2,})$', name_lower)
+        if match:
+            return match.group(1)
+
+        # Fallback: remove extension
+        return Path(filename).stem
+
+    def _get_first_part(self, base_name: str) -> Optional[Path]:
+        """Find the first part of a RAR set (the one to pass to 7z)."""
+        # Try .part1.rar or .part01.rar first
+        for pattern in [f"{base_name}.part1.rar", f"{base_name}.part01.rar", f"{base_name}.part001.rar"]:
+            for f in self.download_dir.glob(pattern):
+                if f.exists():
+                    return f
+
+        # Try case-insensitive
+        for f in self.download_dir.iterdir():
+            name_lower = f.name.lower()
+            if name_lower.startswith(base_name.lower()):
+                if '.part1.rar' in name_lower or '.part01.rar' in name_lower or '.part001.rar' in name_lower:
+                    return f
+
+        # Try main .rar file (for legacy split .r00, .r01 format)
+        for f in self.download_dir.glob(f"{base_name}.rar"):
+            if f.exists():
+                return f
+
+        # Case-insensitive main rar
+        for f in self.download_dir.iterdir():
+            if f.name.lower() == f"{base_name.lower()}.rar":
+                return f
+
+        return None
+
+    def _count_expected_parts(self, base_name: str) -> int:
+        """
+        Count expected parts for a RAR set by scanning download directory.
+
+        Returns expected part count, or 0 if unknown.
+        """
+        # Check cache first
+        if base_name in self._expected_parts_cache:
+            return self._expected_parts_cache[base_name]
+
+        count = 0
+        base_lower = base_name.lower()
+
+        for f in self.download_dir.iterdir():
+            if not f.is_file():
+                continue
+
+            name_lower = f.name.lower()
+
+            # Count .partXX.rar files
+            if name_lower.startswith(base_lower) and '.part' in name_lower and name_lower.endswith('.rar'):
+                count += 1
+            # Count .rar + .rXX files
+            elif name_lower == f"{base_lower}.rar":
+                count += 1
+            elif name_lower.startswith(base_lower) and re.match(r'.*\.r\d{2,}$', name_lower):
+                count += 1
+
+        return count
+
+    def _is_set_complete(self, base_name: str) -> bool:
+        """Check if all parts of a RAR set have been downloaded."""
+        with self._lock:
+            completed_count = len(self._completed_parts[base_name])
+
+        expected_count = self._count_expected_parts(base_name)
+
+        if expected_count == 0:
+            return False
+
+        logger.debug(f"StreamingExtractor: {base_name} - {completed_count}/{expected_count} parts")
+        return completed_count >= expected_count
+
+    def on_file_complete(self, file_path: Path, filename: str) -> None:
+        """
+        Callback for TurboEngineV2.on_file_complete.
+
+        Detects RAR parts and triggers extraction when set is complete.
+
+        Args:
+            file_path: Path to completed file (may be renamed from obfuscated)
+            filename: Original filename from NZB
+        """
+        if not self.sevenzip_path:
+            return
+
+        # Use actual file path for detection (it may have been renamed)
+        actual_name = file_path.name
+
+        if not self._is_rar_part(actual_name):
+            return
+
+        base_name = self._get_rar_base_name(actual_name)
+
+        with self._lock:
+            # Skip if already extracted
+            if base_name in self._extracted_sets:
+                return
+
+            # Track completed part
+            self._completed_parts[base_name].add(file_path)
+            completed_count = len(self._completed_parts[base_name])
+
+        logger.debug(f"StreamingExtractor: RAR part complete: {actual_name} (set: {base_name}, count: {completed_count})")
+
+        # Check if set is complete
+        if self._is_set_complete(base_name):
+            self._queue_extraction(base_name)
+
+    def _queue_extraction(self, base_name: str) -> None:
+        """Queue extraction of RAR set in background."""
+        with self._lock:
+            if base_name in self._extracted_sets:
+                return
+            if base_name in self._pending_futures:
+                return
+            self._extracted_sets.add(base_name)
+
+        first_part = self._get_first_part(base_name)
+        if not first_part:
+            logger.warning(f"StreamingExtractor: Could not find first part for {base_name}")
+            return
+
+        logger.info(f"StreamingExtractor: Queueing extraction of {base_name} ({first_part.name})")
+
+        if self.on_extraction_start:
+            try:
+                self.on_extraction_start(base_name)
+            except Exception:
+                pass
+
+        future = self._extraction_executor.submit(
+            self._extract_set,
+            first_part,
+            base_name
+        )
+
+        with self._lock:
+            self._pending_futures[base_name] = future
+
+    def _extract_set(self, first_part: Path, base_name: str) -> Tuple[bool, int]:
+        """
+        Extract a RAR set using 7z.
+
+        Args:
+            first_part: Path to first RAR part
+            base_name: Base name of the set
+
+        Returns:
+            (success, files_extracted)
+        """
+        start_time = time.time()
+
+        try:
+            # Create output subdirectory
+            output_dir = self.extract_dir / base_name
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Count existing files before extraction
+            existing_files = set(f for f in output_dir.rglob('*') if f.is_file())
+
+            # Build 7z command
+            cmd = [
+                self.sevenzip_path,
+                'x',  # Extract with full paths
+                '-y',  # Yes to all prompts
+                '-bb0',  # Less output
+                '-bd',  # No progress indicator
+                f'-o{output_dir}',
+                f'-mmt={self.threads_per_extraction}',
+            ]
+
+            if self.password:
+                cmd.append(f'-p{self.password}')
+            else:
+                cmd.append('-p')  # Empty password (skip prompts)
+
+            cmd.append(str(first_part))
+
+            logger.info(f"StreamingExtractor: Running 7z for {base_name}")
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(first_part.parent),
+                timeout=7200,  # 2 hours max
+                creationflags=SUBPROCESS_FLAGS
+            )
+
+            elapsed = time.time() - start_time
+
+            if result.returncode == 0:
+                # Count new files
+                current_files = set(f for f in output_dir.rglob('*') if f.is_file())
+                new_files = current_files - existing_files
+                files_count = len(new_files)
+
+                logger.info(f"StreamingExtractor: {base_name} extracted OK: {files_count} files in {elapsed:.1f}s")
+
+                with self._lock:
+                    self._extraction_results.append((base_name, True, files_count))
+
+                if self.on_extraction_complete:
+                    try:
+                        self.on_extraction_complete(base_name, True, files_count)
+                    except Exception:
+                        pass
+
+                return True, files_count
+            else:
+                error_msg = result.stderr or result.stdout or "Unknown error"
+                logger.warning(f"StreamingExtractor: {base_name} extraction failed: {error_msg[:100]}")
+
+                with self._lock:
+                    self._extraction_results.append((base_name, False, 0))
+
+                if self.on_extraction_complete:
+                    try:
+                        self.on_extraction_complete(base_name, False, 0)
+                    except Exception:
+                        pass
+
+                return False, 0
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"StreamingExtractor: {base_name} extraction timeout")
+            with self._lock:
+                self._extraction_results.append((base_name, False, 0))
+            if self.on_extraction_complete:
+                try:
+                    self.on_extraction_complete(base_name, False, 0)
+                except Exception:
+                    pass
+            return False, 0
+
+        except Exception as e:
+            logger.error(f"StreamingExtractor: {base_name} extraction error: {e}")
+            with self._lock:
+                self._extraction_results.append((base_name, False, 0))
+            if self.on_extraction_complete:
+                try:
+                    self.on_extraction_complete(base_name, False, 0)
+                except Exception:
+                    pass
+            return False, 0
+
+    def get_completed_extractions(self) -> List[Tuple[str, bool, int]]:
+        """Get list of (archive_name, success, files_count) for completed extractions."""
+        with self._lock:
+            return list(self._extraction_results)
+
+    def wait_for_pending(self, timeout: float = 300) -> bool:
+        """
+        Wait for all pending extractions to finish.
+
+        Args:
+            timeout: Max seconds to wait
+
+        Returns:
+            True if all extractions completed within timeout
+        """
+        with self._lock:
+            futures = list(self._pending_futures.values())
+
+        if not futures:
+            return True
+
+        logger.info(f"StreamingExtractor: Waiting for {len(futures)} pending extractions...")
+
+        from concurrent.futures import wait, FIRST_EXCEPTION
+        done, not_done = wait(futures, timeout=timeout)
+
+        if not_done:
+            logger.warning(f"StreamingExtractor: {len(not_done)} extractions did not complete in time")
+            return False
+
+        return True
+
+    def get_remaining_archives(self) -> List[Path]:
+        """
+        Get RAR archives that haven't been extracted yet.
+
+        Returns first part of each incomplete/unextracted RAR set.
+        """
+        remaining = []
+
+        with self._lock:
+            extracted = self._extracted_sets.copy()
+
+        # Scan for RAR files
+        seen_bases = set()
+        for f in self.download_dir.iterdir():
+            if not f.is_file():
+                continue
+            if not self._is_rar_part(f.name):
+                continue
+
+            base_name = self._get_rar_base_name(f.name)
+            if base_name in seen_bases:
+                continue
+            if base_name in extracted:
+                continue
+
+            seen_bases.add(base_name)
+            first_part = self._get_first_part(base_name)
+            if first_part:
+                remaining.append(first_part)
+
+        return remaining
+
+    def get_total_extracted_files(self) -> int:
+        """Get total number of files extracted by streaming extractor."""
+        with self._lock:
+            return sum(count for _, success, count in self._extraction_results if success)
+
+    def shutdown(self) -> None:
+        """Shutdown the extraction thread pool."""
+        self._extraction_executor.shutdown(wait=False)
+
+
 class PostProcessor:
     """
     Ultra-fast post-processor for downloaded NZB content.
@@ -1202,13 +1703,34 @@ class PostProcessor:
 
         return metadata
 
-    def find_par2_files(self, directory: Optional[Path] = None) -> List[Path]:
-        """Find all PAR2 files in directory."""
+    def find_par2_files(self, directory: Optional[Path] = None, title_filter: Optional[str] = None) -> List[Path]:
+        """
+        Find all PAR2 files in directory.
+
+        Args:
+            directory: Directory to search (default: download_dir)
+            title_filter: Only include files starting with this title (case-insensitive)
+        """
         search_dir = directory or self.download_dir
         par2_files = []
 
         for ext in ['.par2', '.PAR2']:
             par2_files.extend(search_dir.glob(f'*{ext}'))
+
+        # Filter by title if provided
+        if title_filter:
+            title_lower = title_filter.lower().replace(' ', '.').replace('_', '.')
+            filtered = []
+            for f in par2_files:
+                name_lower = f.name.lower()
+                # Simple prefix match: file should start with title
+                if name_lower.startswith(title_lower):
+                    filtered.append(f)
+            if filtered:
+                par2_files = filtered
+                logger.info(f"PAR2 filter '{title_filter}': {len(par2_files)} files match")
+            else:
+                logger.warning(f"PAR2 filter '{title_filter}': no matches, using all {len(par2_files)} files")
 
         # Sort: main par2 first, then volumes
         def sort_key(p: Path) -> tuple:
@@ -1220,8 +1742,14 @@ class PostProcessor:
 
         return sorted(par2_files, key=sort_key)
 
-    def find_archives(self, directory: Optional[Path] = None) -> List[Path]:
-        """Find all archive files in directory."""
+    def find_archives(self, directory: Optional[Path] = None, title_filter: Optional[str] = None) -> List[Path]:
+        """
+        Find all archive files in directory.
+
+        Args:
+            directory: Directory to search (default: download_dir)
+            title_filter: Only include files starting with this title (case-insensitive)
+        """
         search_dir = directory or self.download_dir
         archives = []
 
@@ -1231,6 +1759,24 @@ class PostProcessor:
             # RAR split archives (.r00, .r01, etc.)
             elif file.is_file() and re.match(r'\.(r|z)\d{2,}$', file.suffix.lower()):
                 archives.append(file)
+            # Split 7z archives (.7z.001, .7z.002, etc.)
+            elif file.is_file() and re.match(r'.*\.7z\.\d{3}$', file.name.lower()):
+                archives.append(file)
+
+        # Filter by title if provided
+        if title_filter:
+            title_lower = title_filter.lower().replace(' ', '.').replace('_', '.')
+            filtered = []
+            for f in archives:
+                name_lower = f.name.lower()
+                # Simple prefix match: file should start with title
+                if name_lower.startswith(title_lower):
+                    filtered.append(f)
+            if filtered:
+                archives = filtered
+                logger.info(f"Archive filter '{title_filter}': {len(archives)} files match")
+            else:
+                logger.warning(f"Archive filter '{title_filter}': no matches, using all {len(archives)} archives")
 
         # Filter to only first part of split archives
         first_parts = []
@@ -1254,6 +1800,12 @@ class PostProcessor:
                     first_parts.append(archive)
             elif archive.suffix.lower() in {'.zip', '.7z', '.tar', '.gz'}:
                 first_parts.append(archive)
+            # Split 7z: .7z.001, .7z.002, etc. - only add first part
+            elif re.match(r'.*\.7z\.001$', archive.name.lower()):
+                base = re.sub(r'\.7z\.001$', '', archive.name.lower())
+                if base not in seen_bases:
+                    seen_bases.add(base)
+                    first_parts.append(archive)
 
         return first_parts
 
@@ -1490,6 +2042,8 @@ class PostProcessor:
         try:
             patterns = ['*.rar', '*.r[0-9][0-9]', '*.zip', '*.7z', '*.par2',
                        '*.PAR2', '*.part*.rar', '*.sfv', '*.SFV',
+                       # Split 7z archives (.7z.001, .7z.002, etc.)
+                       '*.7z.[0-9][0-9][0-9]',
                        # PAR2 backup files (created during repair): *.flac.1, *.mp3.1, etc.
                        '*.[0-9]', '*.[0-9][0-9]']
 
@@ -1559,6 +2113,9 @@ class PostProcessor:
             return True
         # RAR split: .r00, .r01, etc.
         if re.match(r'\.[r]\d{2,}$', suffix):
+            return True
+        # Split 7z: .7z.001, .7z.002, etc.
+        if re.match(r'.*\.7z\.\d{3}$', file.name.lower()):
             return True
         return False
 
@@ -1663,6 +2220,7 @@ class PostProcessor:
         # Scan for archive patterns
         patterns = ['*.rar', '*.r[0-9][0-9]', '*.zip', '*.7z', '*.par2',
                    '*.PAR2', '*.part*.rar', '*.sfv', '*.SFV',
+                   '*.7z.[0-9][0-9][0-9]',  # Split 7z archives
                    '*.[0-9]', '*.[0-9][0-9]']
 
         for pattern in patterns:
@@ -1797,6 +2355,12 @@ class PostProcessor:
                     archives.append(file)
             elif suffix in {'.zip', '.7z'}:
                 archives.append(file)
+            # Split 7z: .7z.001 - only add first part
+            elif re.match(r'.*\.7z\.001$', name_lower):
+                base = re.sub(r'\.7z\.001$', '', name_lower)
+                if base not in seen_bases:
+                    seen_bases.add(base)
+                    archives.append(file)
 
         return archives
 
@@ -2104,14 +2668,15 @@ class PostProcessor:
         source_dir: Optional[Path] = None,
         password: Optional[str] = None,
         early_par2_result: Optional[Tuple[bool, bool, str]] = None,
-        direct_to_destination: bool = False
+        direct_to_destination: bool = False,
+        skip_extraction: bool = False
     ) -> PostProcessResult:
         """
         Full post-processing pipeline.
 
         1. Parse NZB for password (if provided)
         2. Find and verify PAR2 files (or use early result from streaming PAR2)
-        3. Find and extract archives
+        3. Find and extract archives (unless skip_extraction=True)
         4. Optional cleanup
 
         Args:
@@ -2120,6 +2685,7 @@ class PostProcessor:
             password: Override password (if not from NZB)
             early_par2_result: Optional (verified, repaired, message) from streaming PAR2
             direct_to_destination: If True, files are already at final destination (skip move)
+            skip_extraction: If True, skip archive extraction (streaming extractor handled it)
 
         Returns:
             PostProcessResult with details
@@ -2145,7 +2711,9 @@ class PostProcessor:
                     logger.info(f"Using password from NZB: ***")
 
             # Step 2: PAR2 verification (use early result if available)
-            par2_files = self.find_par2_files(src_dir)
+            # Filter by release title to avoid mixing with other downloads in temp dir
+            title_filter = metadata.title if metadata.title else None
+            par2_files = self.find_par2_files(src_dir, title_filter=title_filter)
 
             if early_par2_result:
                 # Use streaming PAR2 result - skip re-verification
@@ -2204,7 +2772,55 @@ class PostProcessor:
                 return result
 
             # Step 3: Smart extraction (handles ZIP→RAR→content)
-            archives = self.find_archives(src_dir)
+            # Skip if streaming extractor already handled extraction
+            if skip_extraction:
+                logger.info("Skipping extraction (handled by streaming extractor)")
+                self._report_progress("Extraction: handled by streaming", 90)
+
+                # Build result message
+                msg_parts = []
+                if result.par2_repaired:
+                    msg_parts.append("PAR2 repaired")
+                elif result.par2_verified:
+                    msg_parts.append("PAR2 verified")
+                msg_parts.append("Streaming extraction")
+
+                # Set extract path for streaming (use extract_dir with release name)
+                release_name = metadata.title if metadata.title else nzb_path.stem if nzb_path else "extracted"
+                result.extract_path = self.extract_dir / release_name
+
+                # Count files at extract path
+                if result.extract_path.exists():
+                    result.files_extracted = sum(1 for _ in result.extract_path.rglob('*') if _.is_file())
+                    try:
+                        result.extracted_bytes = sum(
+                            f.stat().st_size for f in result.extract_path.rglob('*') if f.is_file()
+                        )
+                    except Exception:
+                        pass
+
+                # Mark as successful
+                result.status = PostProcessStatus.COMPLETED
+                result.success = True
+                result.message = f"Completed: {result.files_extracted} files extracted" + (" (repaired)" if result.par2_repaired else "")
+                result.duration_seconds = time.time() - start_time
+
+                # Cleanup temp files if enabled
+                if self.cleanup_after_extract:
+                    self._report_progress("Cleanup...", 95)
+                    if metadata.filenames:
+                        nzb_filenames = set(metadata.filenames)
+                        self.cleanup_archives(src_dir, nzb_filenames)
+                    else:
+                        # Fallback: derive filenames from disk using release title
+                        disk_filenames = self._derive_filenames_from_disk(src_dir, metadata.title)
+                        if disk_filenames:
+                            self.cleanup_archives(src_dir, disk_filenames)
+                    self._report_progress("Cleanup complete", 100)
+
+                return result
+
+            archives = self.find_archives(src_dir, title_filter=title_filter)
             if archives:
                 # Get release name for subfolder
                 release_name = metadata.title if nzb_path else None
