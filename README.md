@@ -1,7 +1,5 @@
-# DLER - Ultra-Fast Usenet Downloader
-
 <div align="center">
-    <img src="logo.png" width="300" alt="DLER">
+    <img src="assets/matrix-banner.svg" alt="DLER Matrix Banner" width="100%">
 </div>
 
 High-performance NZB downloader engineered for **maximum throughput** on modern hardware. Built for users who want simplicity without sacrificing speed.
@@ -360,5 +358,5 @@ Contributions welcome! Please:
 ---
 
 <div align="center">
-    <strong>DLER v1.2.0</strong> - Download at wire speed.
+    <img src="logo.png" width="200" alt="DLER">
 </div>
