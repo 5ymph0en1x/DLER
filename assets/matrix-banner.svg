@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 200" width="800" height="200">
+  <defs>
+    <!-- Matrix green gradient -->
+    <linearGradient id="matrixGlow" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#00ff41;stop-opacity:1"/>
+      <stop offset="50%" style="stop-color:#00cc33;stop-opacity:0.8"/>
+      <stop offset="100%" style="stop-color:#003300;stop-opacity:0"/>
+    </linearGradient>
+
+    <!-- Text glow filter -->
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Stronger glow for main text -->
+    <filter id="strongGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="6" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <style>
+    @keyframes fall1 { 0% { transform: translateY(-200px); opacity: 0; } 10% { opacity: 1; } 90% { opacity: 1; } 100% { transform: translateY(220px); opacity: 0; } }
+    @keyframes fall2 { 0% { transform: translateY(-180px); opacity: 0; } 15% { opacity: 1; } 85% { opacity: 1; } 100% { transform: translateY(240px); opacity: 0; } }
+    @keyframes fall3 { 0% { transform: translateY(-160px); opacity: 0; } 20% { opacity: 1; } 80% { opacity: 1; } 100% { transform: translateY(260px); opacity: 0; } }
+    @keyframes pulse { 0%, 100% { opacity: 0.9; } 50% { opacity: 1; } }
+    @keyframes flicker { 0%, 100% { opacity: 1; } 50% { opacity: 0.8; } 25%, 75% { opacity: 0.95; } }
+
+    .matrix-char { font-family: 'Courier New', monospace; fill: #00ff41; font-size: 14px; }
+    .matrix-char-dim { font-family: 'Courier New', monospace; fill: #006622; font-size: 14px; }
+    .matrix-char-bright { font-family: 'Courier New', monospace; fill: #88ff88; font-size: 14px; filter: url(#glow); }
+
+    .col1 { animation: fall1 3.2s linear infinite; }
+    .col2 { animation: fall2 2.8s linear infinite 0.3s; }
+    .col3 { animation: fall1 3.5s linear infinite 0.7s; }
+    .col4 { animation: fall3 2.6s linear infinite 0.2s; }
+    .col5 { animation: fall2 3.1s linear infinite 0.9s; }
+    .col6 { animation: fall1 2.9s linear infinite 0.5s; }
+    .col7 { animation: fall3 3.3s linear infinite 0.1s; }
+    .col8 { animation: fall2 2.7s linear infinite 0.8s; }
+    .col9 { animation: fall1 3.4s linear infinite 0.4s; }
+    .col10 { animation: fall3 3.0s linear infinite 0.6s; }
+    .col11 { animation: fall2 3.6s linear infinite 0.15s; }
+    .col12 { animation: fall1 2.5s linear infinite 0.85s; }
+    .col13 { animation: fall3 3.2s linear infinite 0.45s; }
+    .col14 { animation: fall2 2.9s linear infinite 0.25s; }
+    .col15 { animation: fall1 3.1s linear infinite 0.75s; }
+    .col16 { animation: fall3 2.8s linear infinite 0.55s; }
+    .col17 { animation: fall2 3.4s linear infinite 0.35s; }
+    .col18 { animation: fall1 3.0s linear infinite 0.95s; }
+    .col19 { animation: fall3 2.6s linear infinite 0.65s; }
+    .col20 { animation: fall2 3.3s linear infinite 0.05s; }
+
+    .main-title {
+      font-family: 'Courier New', monospace;
+      font-weight: bold;
+      font-size: 72px;
+      fill: #00ff41;
+      filter: url(#strongGlow);
+      animation: pulse 2s ease-in-out infinite;
+    }
+    .subtitle {
+      font-family: 'Courier New', monospace;
+      font-size: 16px;
+      fill: #00cc33;
+      filter: url(#glow);
+      animation: flicker 3s ease-in-out infinite;
+    }
+    .version {
+      font-family: 'Courier New', monospace;
+      font-size: 12px;
+      fill: #00aa22;
+    }
+  </style>
+
+  <!-- Background -->
+  <rect width="100%" height="100%" fill="#0d0d0d"/>
+
+  <!-- Matrix rain columns - left side -->
+  <g class="col1"><text class="matrix-char-bright" x="20" y="0">D</text><text class="matrix-char" x="20" y="18">7</text><text class="matrix-char" x="20" y="36">ネ</text><text class="matrix-char-dim" x="20" y="54">9</text><text class="matrix-char-dim" x="20" y="72">Z</text></g>
+  <g class="col2"><text class="matrix-char-bright" x="45" y="0">L</text><text class="matrix-char" x="45" y="18">コ</text><text class="matrix-char" x="45" y="36">4</text><text class="matrix-char-dim" x="45" y="54">ト</text><text class="matrix-char-dim" x="45" y="72">1</text></g>
+  <g class="col3"><text class="matrix-char-bright" x="70" y="0">E</text><text class="matrix-char" x="70" y="18">8</text><text class="matrix-char" x="70" y="36">ア</text><text class="matrix-char-dim" x="70" y="54">3</text><text class="matrix-char-dim" x="70" y="72">マ</text></g>
+  <g class="col4"><text class="matrix-char-bright" x="95" y="0">R</text><text class="matrix-char" x="95" y="18">ウ</text><text class="matrix-char" x="95" y="36">0</text><text class="matrix-char-dim" x="95" y="54">X</text><text class="matrix-char-dim" x="95" y="72">5</text></g>
+  <g class="col5"><text class="matrix-char-bright" x="120" y="0">1</text><text class="matrix-char" x="120" y="18">2</text><text class="matrix-char" x="120" y="36">リ</text><text class="matrix-char-dim" x="120" y="54">ク</text><text class="matrix-char-dim" x="120" y="72">7</text></g>
+  <g class="col6"><text class="matrix-char-bright" x="145" y="0">ン</text><text class="matrix-char" x="145" y="18">6</text><text class="matrix-char" x="145" y="36">B</text><text class="matrix-char-dim" x="145" y="54">イ</text><text class="matrix-char-dim" x="145" y="72">4</text></g>
+  <g class="col7"><text class="matrix-char-bright" x="170" y="0">3</text><text class="matrix-char" x="170" y="18">カ</text><text class="matrix-char" x="170" y="36">F</text><text class="matrix-char-dim" x="170" y="54">9</text><text class="matrix-char-dim" x="170" y="72">サ</text></g>
+  <g class="col8"><text class="matrix-char-bright" x="195" y="0">タ</text><text class="matrix-char" x="195" y="18">0</text><text class="matrix-char" x="195" y="36">J</text><text class="matrix-char-dim" x="195" y="54">エ</text><text class="matrix-char-dim" x="195" y="72">2</text></g>
+  <g class="col9"><text class="matrix-char-bright" x="220" y="0">G</text><text class="matrix-char" x="220" y="18">オ</text><text class="matrix-char" x="220" y="36">5</text><text class="matrix-char-dim" x="220" y="54">H</text><text class="matrix-char-dim" x="220" y="72">セ</text></g>
+  <g class="col10"><text class="matrix-char-bright" x="245" y="0">キ</text><text class="matrix-char" x="245" y="18">P</text><text class="matrix-char" x="245" y="36">1</text><text class="matrix-char-dim" x="245" y="54">ソ</text><text class="matrix-char-dim" x="245" y="72">8</text></g>
+
+  <!-- Matrix rain columns - right side -->
+  <g class="col11"><text class="matrix-char-bright" x="555" y="0">N</text><text class="matrix-char" x="555" y="18">チ</text><text class="matrix-char" x="555" y="36">6</text><text class="matrix-char-dim" x="555" y="54">T</text><text class="matrix-char-dim" x="555" y="72">ツ</text></g>
+  <g class="col12"><text class="matrix-char-bright" x="580" y="0">4</text><text class="matrix-char" x="580" y="18">N</text><text class="matrix-char" x="580" y="36">テ</text><text class="matrix-char-dim" x="580" y="54">2</text><text class="matrix-char-dim" x="580" y="72">Z</text></g>
+  <g class="col13"><text class="matrix-char-bright" x="605" y="0">ナ</text><text class="matrix-char" x="605" y="18">T</text><text class="matrix-char" x="605" y="36">9</text><text class="matrix-char-dim" x="605" y="54">P</text><text class="matrix-char-dim" x="605" y="72">ニ</text></g>
+  <g class="col14"><text class="matrix-char-bright" x="630" y="0">7</text><text class="matrix-char" x="630" y="18">ヌ</text><text class="matrix-char" x="630" y="36">S</text><text class="matrix-char-dim" x="630" y="54">3</text><text class="matrix-char-dim" x="630" y="72">ネ</text></g>
+  <g class="col15"><text class="matrix-char-bright" x="655" y="0">ノ</text><text class="matrix-char" x="655" y="18">1</text><text class="matrix-char" x="655" y="36">U</text><text class="matrix-char-dim" x="655" y="54">ハ</text><text class="matrix-char-dim" x="655" y="72">5</text></g>
+  <g class="col16"><text class="matrix-char-bright" x="680" y="0">V</text><text class="matrix-char" x="680" y="18">ヒ</text><text class="matrix-char" x="680" y="36">0</text><text class="matrix-char-dim" x="680" y="54">8</text><text class="matrix-char-dim" x="680" y="72">フ</text></g>
+  <g class="col17"><text class="matrix-char-bright" x="705" y="0">2</text><text class="matrix-char" x="705" y="18">W</text><text class="matrix-char" x="705" y="36">ヘ</text><text class="matrix-char-dim" x="705" y="54">6</text><text class="matrix-char-dim" x="705" y="72">ホ</text></g>
+  <g class="col18"><text class="matrix-char-bright" x="730" y="0">マ</text><text class="matrix-char" x="730" y="18">4</text><text class="matrix-char" x="730" y="36">X</text><text class="matrix-char-dim" x="730" y="54">ミ</text><text class="matrix-char-dim" x="730" y="72">1</text></g>
+  <g class="col19"><text class="matrix-char-bright" x="755" y="0">Y</text><text class="matrix-char" x="755" y="18">ム</text><text class="matrix-char" x="755" y="36">3</text><text class="matrix-char-dim" x="755" y="54">9</text><text class="matrix-char-dim" x="755" y="72">メ</text></g>
+  <g class="col20"><text class="matrix-char-bright" x="780" y="0">7</text><text class="matrix-char" x="780" y="18">モ</text><text class="matrix-char" x="780" y="36">Z</text><text class="matrix-char-dim" x="780" y="54">ヤ</text><text class="matrix-char-dim" x="780" y="72">0</text></g>
+
+  <!-- Main DLER text -->
+  <text class="main-title" x="400" y="115" text-anchor="middle">DLER</text>
+
+  <!-- Subtitle -->
+  <text class="subtitle" x="400" y="150" text-anchor="middle">[ ULTRA-FAST USENET DOWNLOADER ]</text>
+
+  <!-- Binary decoration -->
+  <text class="version" x="400" y="175" text-anchor="middle">// Download at wire speed //</text>
+
+  <!-- Scanline effect -->
+  <rect width="100%" height="100%" fill="url(#matrixGlow)" opacity="0.03"/>
+</svg>
