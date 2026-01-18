@@ -285,8 +285,23 @@ class DLERApp:
         tkdnd passes file paths as a string. Paths with spaces are enclosed
         in curly braces: {path with spaces}
         """
+        logger.info(f"[DND] Raw drop data: {repr(raw_data)}")
+
         # Parse file paths from tkdnd format
+        # tkdnd on Windows can return paths in various formats:
+        # - Simple path: C:/path/to/file.nzb
+        # - Path with spaces in braces: {C:/path with spaces/file.nzb}
+        # - Multiple paths space-separated
         files = []
+
+        # Strip outer whitespace
+        raw_data = raw_data.strip()
+
+        # Handle double braces from Tcl binding + tkdnd: {{path}} -> {path}
+        while raw_data.startswith('{{') and raw_data.endswith('}}'):
+            raw_data = raw_data[1:-1]
+            logger.debug(f"[DND] Unwrapped double braces: {repr(raw_data)}")
+
         if '{' in raw_data:
             # Handle curly brace notation for paths with spaces
             import re
@@ -296,17 +311,49 @@ class DLERApp:
             if remaining:
                 files.extend(remaining.split())
         else:
-            files = raw_data.split()
+            # No braces - could be single path or space-separated paths
+            # Check if it looks like a single Windows path (contains drive letter)
+            if len(raw_data) > 2 and raw_data[1] == ':':
+                # Windows path - but might have spaces. Check if file exists as single path.
+                # Try the whole string first (handles "C:/path with spaces/file.nzb")
+                test_path = Path(raw_data.replace('/', '\\') if '/' in raw_data else raw_data)
+                if test_path.exists():
+                    files = [raw_data]
+                else:
+                    # Doesn't exist as-is, try splitting on drive letter patterns
+                    # This handles multiple Windows paths: "C:/file1.nzb D:/file2.nzb"
+                    import re
+                    # Split on space followed by drive letter (C:, D:, etc.)
+                    parts = re.split(r'\s+(?=[A-Za-z]:)', raw_data)
+                    files = [p.strip() for p in parts if p.strip()]
+            else:
+                files = raw_data.split()
+
+        logger.info(f"[DND] Parsed {len(files)} file(s): {files}")
 
         # Filter for NZB files only
         nzb_files = []
         for f in files:
-            path = Path(f)
-            if path.exists() and path.suffix.lower() == '.nzb':
+            # Normalize path: handle forward slashes from tkdnd on Windows
+            f_normalized = f.replace('/', '\\') if '/' in f else f
+            path = Path(f_normalized)
+
+            exists = path.exists()
+            suffix = path.suffix.lower()
+            logger.info(f"[DND] Checking: '{path}' exists={exists} suffix='{suffix}'")
+
+            if exists and suffix == '.nzb':
                 nzb_files.append(path)
+            elif not exists:
+                # Try without normalization in case Path handles it
+                path_orig = Path(f)
+                if path_orig.exists() and path_orig.suffix.lower() == '.nzb':
+                    nzb_files.append(path_orig)
+                    logger.info(f"[DND] Found with original path: {path_orig}")
 
         if not nzb_files:
             self._log("No valid NZB files dropped", "warning")
+            logger.warning(f"[DND] No valid NZB found. Raw: {repr(raw_data)}")
             return
 
         # Add to queue

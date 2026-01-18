@@ -1,4 +1,4 @@
-# DLER v1.2.0 - High-Performance NZB Downloader
+# DLER v1.2.1 - High-Performance NZB Downloader
 # Requirements for full functionality
 
 # === Core Dependencies ===

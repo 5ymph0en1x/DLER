@@ -6,17 +6,17 @@ Ultra-fast post-processing pipeline that keeps all data in RAM:
 1. Stores downloaded/decoded files in memory (BytesIO)
 2. PAR2 verification using pure Python (MD5 checksums)
 3. PAR2 repair using GPU-accelerated Reed-Solomon (CUDA/CuPy)
-4. Archive extraction from RAM (py7zr for 7z)
+4. Archive extraction from RAM (7z.dll for 7z, UnRAR.dll for RAR)
 5. Final flush to destination disk
 
 Performance targets (RTX 4090 + 96GB RAM):
 - PAR2 verification: ~5 GB/s (parallel MD5)
 - PAR2 repair: ~15 GB/s (CUDA Reed-Solomon)
-- Extraction: ~2 GB/s (from RAM)
+- Extraction: ~2 GB/s (from RAM via native DLLs)
 
 Requirements:
 - cupy (for GPU acceleration)
-- py7zr (for 7z extraction from memory)
+- 7z.dll (for fast 7z extraction, falls back to 7z.exe CLI)
 """
 
 from __future__ import annotations
@@ -146,13 +146,25 @@ except Exception as e:
     import traceback
     logger.debug(traceback.format_exc())
 
-# Try to import py7zr for in-memory 7z extraction
+# Try to import ram_7z for fast 7z extraction via 7z.dll
+RAM_7Z_AVAILABLE = False
+try:
+    from src.core.ram_7z import Ram7zExtractor, RAM_7Z_AVAILABLE as _ram_7z_avail
+    RAM_7Z_AVAILABLE = _ram_7z_avail
+    if RAM_7Z_AVAILABLE:
+        logger.info("[RAM] 7z.dll loaded - fast 7z extraction enabled")
+    else:
+        logger.info("[RAM] 7z.dll not available - will use 7z.exe CLI fallback")
+except ImportError as e:
+    logger.debug(f"[RAM] ram_7z module not available: {e}")
+
+# Legacy py7zr import (fallback)
+PY7ZR_AVAILABLE = False
 try:
     import py7zr
     PY7ZR_AVAILABLE = True
 except ImportError:
-    PY7ZR_AVAILABLE = False
-    logger.warning("py7zr not available: RAM-based 7z extraction disabled")
+    pass
 
 
 @dataclass
@@ -2078,56 +2090,106 @@ class RamPostProcessor:
 
             # Extract 7z if found
             if first_7z and first_7z.exists() and extracted == 0:
-                logger.info(f"[FAST] 7z extraction: {first_7z.name}")
                 extract_start = time.time()
+                use_dll = False
 
-                creationflags = 0
-                if sys.platform == 'win32':
-                    creationflags = subprocess.CREATE_NO_WINDOW
+                # Try RAM-based extraction via 7z.dll first (faster)
+                if RAM_7Z_AVAILABLE:
+                    try:
+                        logger.info(f"[FAST] 7z extraction via 7z.dll: {first_7z.name}")
+                        archive_data = first_7z.read_bytes()
 
-                cmd = [
-                    sevenzip_path,
-                    'x',  # Extract with full paths
-                    '-y',  # Yes to all prompts
-                    '-bb0',  # Less output
-                    '-bd',  # No progress indicator
-                    '-mmt=on',  # Multi-threading for maximum speed
-                    f'-o{extract_path}',
-                ]
+                        extractor = Ram7zExtractor()
+                        extractor.set_archive_data(archive_data)
+                        if self.password:
+                            extractor.set_password(self.password)
 
-                if self.password:
-                    cmd.append(f'-p{self.password}')
-                else:
-                    cmd.append('-p')
+                        extracted_dict = extractor.extract_all()
 
-                cmd.append(str(first_7z))
+                        if extracted_dict:
+                            # Write extracted files to destination
+                            for filename, file_data in extracted_dict.items():
+                                dest_path = extract_path / filename
+                                dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    cwd=str(temp_dir),
-                    timeout=3600,
-                    creationflags=creationflags
-                )
+                                # Handle Windows long paths
+                                dest_str = str(dest_path.resolve())
+                                if len(dest_str) > 200 and not dest_str.startswith('\\\\?\\'):
+                                    dest_str = '\\\\?\\' + dest_str
 
-                extract_elapsed = time.time() - extract_start
+                                Path(dest_str).write_bytes(file_data)
 
-                if result.returncode == 0:
-                    extracted_files = list(extract_path.rglob('*'))
-                    extracted_files = [f for f in extracted_files if f.is_file()]
-                    extracted = len(extracted_files)
-                    logger.info(f"7z extraction complete: {extracted} files in {extract_elapsed:.1f}s")
-                    self._fix_obfuscated_files(extracted_files, release_name)
+                            extract_elapsed = time.time() - extract_start
+                            extracted_files = list(extract_path.rglob('*'))
+                            extracted_files = [f for f in extracted_files if f.is_file()]
+                            extracted = len(extracted_files)
+                            logger.info(f"7z.dll extraction complete: {extracted} files in {extract_elapsed:.1f}s")
+                            self._fix_obfuscated_files(extracted_files, release_name)
+                            use_dll = True
 
-                    # Extract any nested archives
-                    nested_count = self._extract_nested_archives(extract_path, release_name)
-                    if nested_count > 0:
+                            # Extract any nested archives
+                            nested_count = self._extract_nested_archives(extract_path, release_name)
+                            if nested_count > 0:
+                                extracted_files = list(extract_path.rglob('*'))
+                                extracted_files = [f for f in extracted_files if f.is_file()]
+                                extracted = len(extracted_files)
+                        else:
+                            logger.warning(f"7z.dll extraction returned no files: {extractor.get_last_error()}")
+                    except Exception as e:
+                        logger.warning(f"7z.dll extraction failed: {e}, falling back to CLI")
+
+                # Fallback to 7z.exe CLI if DLL extraction didn't work
+                if not use_dll and extracted == 0:
+                    logger.info(f"[FAST] 7z extraction via CLI: {first_7z.name}")
+                    extract_start = time.time()
+
+                    creationflags = 0
+                    if sys.platform == 'win32':
+                        creationflags = subprocess.CREATE_NO_WINDOW
+
+                    cmd = [
+                        sevenzip_path,
+                        'x',  # Extract with full paths
+                        '-y',  # Yes to all prompts
+                        '-bb0',  # Less output
+                        '-bd',  # No progress indicator
+                        '-mmt=on',  # Multi-threading for maximum speed
+                        f'-o{extract_path}',
+                    ]
+
+                    if self.password:
+                        cmd.append(f'-p{self.password}')
+                    else:
+                        cmd.append('-p')
+
+                    cmd.append(str(first_7z))
+
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        cwd=str(temp_dir),
+                        timeout=3600,
+                        creationflags=creationflags
+                    )
+
+                    extract_elapsed = time.time() - extract_start
+
+                    if result.returncode == 0:
                         extracted_files = list(extract_path.rglob('*'))
                         extracted_files = [f for f in extracted_files if f.is_file()]
                         extracted = len(extracted_files)
-                else:
-                    logger.error(f"7z extraction failed: {result.stderr or result.stdout}")
+                        logger.info(f"7z CLI extraction complete: {extracted} files in {extract_elapsed:.1f}s")
+                        self._fix_obfuscated_files(extracted_files, release_name)
+
+                        # Extract any nested archives
+                        nested_count = self._extract_nested_archives(extract_path, release_name)
+                        if nested_count > 0:
+                            extracted_files = list(extract_path.rglob('*'))
+                            extracted_files = [f for f in extracted_files if f.is_file()]
+                            extracted = len(extracted_files)
+                    else:
+                        logger.error(f"7z extraction failed: {result.stderr or result.stdout}")
 
             # Extract ZIP if found (and nothing else was extracted)
             # Use 7z to extract ZIPs from temp files (fast path)

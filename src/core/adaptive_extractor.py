@@ -58,6 +58,7 @@ class ExtractionTool(Enum):
     """Available extraction tools."""
     UNRAR_DLL = "unrar"                     # RAM RAR via UnRAR DLL
     ZIPFILE = "zipfile"                     # Python zipfile (RAM)
+    SEVENZIP_DLL = "7z_dll"                 # 7z.dll RAM extraction (fast)
     SEVENZIP_CLI = "7z"                     # 7z.exe fallback (disk)
     DIRECT_FLUSH = "flush"                  # No extraction needed
 
@@ -569,11 +570,11 @@ class ExtractionStrategy:
             stages=[
                 ExtractionStage(
                     stage_number=1,
-                    tool=ExtractionTool.SEVENZIP_CLI,
+                    tool=ExtractionTool.SEVENZIP_DLL,
                     input_pattern="*.7z",
                     output_type="content",
                     keep_in_ram=False,
-                    description="Extract 7z via 7-Zip CLI"
+                    description="Extract 7z via 7z.dll (fast)"
                 )
             ],
             expects_nested=True,
@@ -588,11 +589,11 @@ class ExtractionStrategy:
             stages=[
                 ExtractionStage(
                     stage_number=1,
-                    tool=ExtractionTool.SEVENZIP_CLI,
+                    tool=ExtractionTool.SEVENZIP_DLL,
                     input_pattern="*",
                     output_type="content",
                     keep_in_ram=False,
-                    description="Fallback: extract all via 7-Zip"
+                    description="Fallback: extract all via 7z.dll"
                 )
             ],
             expects_nested=True,
@@ -752,6 +753,8 @@ class AdaptiveExtractor:
             return self._execute_rar_extraction(stage)
         elif stage.tool == ExtractionTool.ZIPFILE:
             return self._execute_zip_extraction(stage)
+        elif stage.tool == ExtractionTool.SEVENZIP_DLL:
+            return self._execute_7z_dll_extraction(stage)
         elif stage.tool == ExtractionTool.SEVENZIP_CLI:
             return self._execute_7z_extraction(stage)
         else:
@@ -1721,6 +1724,93 @@ class AdaptiveExtractor:
 
         return files_written
 
+    def _execute_7z_dll_extraction(self, stage: ExtractionStage) -> StageResult:
+        """Extract using 7z.dll (fast RAM-based extraction)."""
+        try:
+            from src.core.ram_7z import Ram7zExtractor, RAM_7Z_AVAILABLE
+        except ImportError:
+            logger.warning("[ADAPTIVE] ram_7z module not available, falling back to CLI")
+            return self._execute_7z_extraction(stage)
+
+        if not RAM_7Z_AVAILABLE:
+            logger.info("[ADAPTIVE] 7z.dll not available, falling back to CLI")
+            return self._execute_7z_extraction(stage)
+
+        # Collect 7z archives from RAM buffer
+        archives_to_extract = []
+        for key, ram_file in self.ram_buffer.get_all_files().items():
+            if self._matches_pattern(ram_file.filename, stage.input_pattern):
+                if self._is_archive_by_magic(ram_file):
+                    ram_file.data.seek(0)
+                    read_size = ram_file.actual_size or ram_file.size
+                    data = ram_file.data.read(read_size)
+                    archives_to_extract.append((ram_file.filename, data))
+
+        if not archives_to_extract:
+            return StageResult()
+
+        total_extracted = 0
+        found_types: Set[str] = set()
+        errors = []
+
+        for archive_name, archive_data in archives_to_extract:
+            logger.info(f"[ADAPTIVE] Extracting {archive_name} via 7z.dll ({len(archive_data) / (1024*1024):.1f} MB)")
+
+            try:
+                extractor = Ram7zExtractor()
+                extractor.set_archive_data(archive_data)
+                if self.password:
+                    extractor.set_password(self.password)
+
+                extracted_files = extractor.extract_all()
+
+                if not extracted_files:
+                    error = extractor.get_last_error()
+                    if error:
+                        logger.warning(f"[ADAPTIVE] 7z.dll extraction failed for {archive_name}: {error}")
+                        errors.append(f"{archive_name}: {error}")
+                    continue
+
+                # Write extracted files to disk
+                for filename, file_data in extracted_files.items():
+                    dest_path = self.extract_dir / filename
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    # Handle Windows long paths
+                    dest_str = str(dest_path.resolve())
+                    if len(dest_str) > 200 and not dest_str.startswith('\\\\?\\'):
+                        dest_str = '\\\\?\\' + dest_str
+
+                    Path(dest_str).write_bytes(file_data)
+                    total_extracted += 1
+
+                    # Track types for nested extraction
+                    ext = self._get_extension(filename)
+                    if ext == '.rar' or re.match(r'\.[rs]\d{2}$', ext):
+                        found_types.add('rar')
+                    elif ext == '.7z':
+                        found_types.add('7z')
+                    elif ext in {'.mkv', '.mp4', '.avi', '.iso'}:
+                        found_types.add('media')
+
+                logger.info(f"[ADAPTIVE] 7z.dll extracted {len(extracted_files)} files from {archive_name}")
+
+            except Exception as e:
+                logger.warning(f"[ADAPTIVE] 7z.dll failed for {archive_name}: {e}, trying CLI fallback")
+                errors.append(f"{archive_name}: {str(e)}")
+
+        # If DLL extraction failed completely, fallback to CLI
+        if total_extracted == 0 and errors:
+            logger.info("[ADAPTIVE] 7z.dll extraction failed, falling back to CLI")
+            return self._execute_7z_extraction(stage)
+
+        return StageResult(
+            files_extracted=total_extracted,
+            found_types=found_types,
+            needs_adaptation='rar' in found_types or '7z' in found_types,
+            errors=errors if errors else None
+        )
+
     def _execute_7z_extraction(self, stage: ExtractionStage) -> StageResult:
         """Extract using 7-Zip CLI."""
         import subprocess
@@ -1811,11 +1901,11 @@ class AdaptiveExtractor:
         if '7z' in result.found_types:
             new_stages.append(ExtractionStage(
                 stage_number=next_stage_num + len(new_stages),
-                tool=ExtractionTool.SEVENZIP_CLI,
+                tool=ExtractionTool.SEVENZIP_DLL,
                 input_pattern="*.7z",
                 output_type="content",
                 keep_in_ram=False,
-                description="Extract nested 7z archives"
+                description="Extract nested 7z archives via 7z.dll"
             ))
 
         return new_stages

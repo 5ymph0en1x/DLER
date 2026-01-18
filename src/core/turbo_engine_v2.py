@@ -159,6 +159,11 @@ TurboYEncDecoder = _turbo_yenc_mod.TurboYEncDecoder
 NATIVE_AVAILABLE = _turbo_yenc_mod.NATIVE_AVAILABLE
 NUMBA_AVAILABLE = _turbo_yenc_mod.NUMBA_AVAILABLE
 
+# v1.3.0: Import retry and adaptive pipeline classes
+RetryConfig = _fast_nntp_mod.RetryConfig
+AdaptivePipeline = _fast_nntp_mod.AdaptivePipeline
+ConnectionHealth = _fast_nntp_mod.ConnectionHealth
+
 logger = logging.getLogger(__name__)
 
 
@@ -314,14 +319,16 @@ class TurboEngineV2:
         download_threads: int = 60,  # Increased for 10 Gbps
         decoder_threads: int = 0,    # 0 = auto (24 for 5950X)
         writer_threads: int = 12,    # Increased for throughput
-        pipeline_depth: int = 30,    # Deeper pipeline
+        pipeline_depth: int = 30,    # Initial pipeline depth (adaptive if enabled)
         write_through: bool = False, # Bypass OS cache
         on_progress: Optional[Callable] = None,
         on_file_complete: Optional[Callable[[Path, str], None]] = None,  # Streaming PAR2 callback
         ram_buffer: Optional['RamBuffer'] = None,  # RAM-based storage (no disk writes)
         raw_queue_size: int = 16000,   # ~12 GB buffer for raw data
         write_queue_size: int = 8000,  # ~6 GB buffer for decoded data
-        incremental_verify: bool = True  # Enable incremental PAR2 verification
+        incremental_verify: bool = True,  # Enable incremental PAR2 verification
+        retry_config: Optional[RetryConfig] = None,  # v1.3.0: Retry configuration
+        use_adaptive_pipeline: bool = True  # v1.3.0: Enable adaptive pipelining
     ):
         self.server_config = server_config
         self.output_dir = Path(output_dir)
@@ -338,6 +345,13 @@ class TurboEngineV2:
         self.raw_queue_size = raw_queue_size
         self.write_queue_size = write_queue_size
         self.incremental_verify = incremental_verify
+
+        # v1.3.0: Retry and adaptive pipeline configuration
+        self.retry_config = retry_config or RetryConfig()
+        self.use_adaptive_pipeline = use_adaptive_pipeline
+        self._adaptive_pipeline: Optional[AdaptivePipeline] = None
+        if use_adaptive_pipeline:
+            self._adaptive_pipeline = AdaptivePipeline(initial_depth=pipeline_depth)
 
         # Incremental verification state
         self._par2_db: Optional['Par2FileDatabase'] = None
@@ -401,11 +415,12 @@ class TurboEngineV2:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def connect(self) -> int:
-        """Establish all NNTP connections."""
+        """Establish all NNTP connections with retry support."""
         print(f"Connecting to {self.server_config.host}:{self.server_config.port}...")
 
         def create_conn(i: int) -> Optional[NNTPConnection]:
-            conn = NNTPConnection(self.server_config, i)
+            # v1.3.0: Pass retry_config for exponential backoff on connection failures
+            conn = NNTPConnection(self.server_config, i, retry_config=self.retry_config)
             return conn if conn.connect() else None
 
         # Parallel connection establishment
@@ -417,6 +432,14 @@ class TurboEngineV2:
                 conn = future.result()
                 if conn:
                     self._connections.append(conn)
+                    # v1.3.0: Record initial RTT for adaptive pipeline
+                    if self._adaptive_pipeline and conn.avg_rtt_ms > 0:
+                        self._adaptive_pipeline.record_rtt(conn.avg_rtt_ms)
+
+        # v1.3.0: Adjust pipeline depth based on initial RTT measurements
+        if self._adaptive_pipeline and self._connections:
+            new_depth = self._adaptive_pipeline.adjust()
+            logger.info(f"[PIPELINE] Initial depth: {new_depth} (avg RTT: {self._adaptive_pipeline.get_avg_rtt():.1f}ms)")
 
         print(f"Connected: {len(self._connections)}/{self.server_config.connections}")
         return len(self._connections)
@@ -787,11 +810,14 @@ class TurboEngineV2:
 
         Fetches raw data and puts it in raw_queue.
         Never touches disk, never decodes.
+
+        v1.3.0: Uses adaptive pipeline depth based on RTT measurements.
         """
         local_bytes = 0
         local_segs = 0
         local_errors = 0
         update_counter = 0
+        rtt_update_counter = 0
 
         def get_next_id():
             try:
@@ -801,7 +827,7 @@ class TurboEngineV2:
                 return None
 
         def on_data(msg_id: str, data: Optional[bytes]):
-            nonlocal local_bytes, local_segs, local_errors, update_counter
+            nonlocal local_bytes, local_segs, local_errors, update_counter, rtt_update_counter
 
             segment = segment_map.get(msg_id)
             if segment and data:
@@ -814,6 +840,14 @@ class TurboEngineV2:
 
             work_queue.task_done()
             update_counter += 1
+            rtt_update_counter += 1
+
+            # v1.3.0: Record RTT samples and adjust pipeline periodically
+            if self._adaptive_pipeline and rtt_update_counter >= 10:
+                if conn.avg_rtt_ms > 0:
+                    self._adaptive_pipeline.record_rtt(conn.avg_rtt_ms)
+                    self._adaptive_pipeline.adjust()
+                rtt_update_counter = 0
 
             # Update stats frequently for smooth display
             if update_counter >= 5:
@@ -826,14 +860,17 @@ class TurboEngineV2:
                 local_errors = 0
                 update_counter = 0
 
+        # v1.3.0: Get pipeline depth from adaptive pipeline or use fixed value
+        pipeline_depth = self._adaptive_pipeline.depth if self._adaptive_pipeline else self.pipeline_depth
+
         # Use streaming fetch - this blocks until queue is empty
         # Pass pause_event and stop_flag for immediate pause/stop response
         try:
-            logger.debug(f"{threading.current_thread().name}: Starting fetch_streaming")
+            logger.debug(f"{threading.current_thread().name}: Starting fetch_streaming (pipeline={pipeline_depth})")
             conn.fetch_streaming(
                 get_next_id,
                 on_data,
-                self.pipeline_depth,
+                pipeline_depth,
                 pause_event=self._pause_event,
                 stop_flag=lambda: self._stop_requested
             )
@@ -1149,9 +1186,19 @@ class TurboEngineV2:
             # Get RAM usage
             ram_mb = get_process_memory_mb()
 
+            # v1.3.0: Show adaptive pipeline depth
+            pipe_info = ""
+            if self._adaptive_pipeline:
+                pipe_depth = self._adaptive_pipeline.depth
+                avg_rtt = self._adaptive_pipeline.get_avg_rtt()
+                if avg_rtt:
+                    pipe_info = f" | P:{pipe_depth}@{avg_rtt:.0f}ms"
+                else:
+                    pipe_info = f" | P:{pipe_depth}"
+
             print(f"\r[{percent:5.1f}%] {speed:7.1f} MB/s | "
                   f"DL:{dl_segs} -> Dec:{dec_segs} -> Wr:{wr_segs}/{total} | "
-                  f"Q[{raw_q}/{write_q}] | RAM:{ram_mb:.0f}MB | Err:{errors}   ",
+                  f"Q[{raw_q}/{write_q}]{pipe_info} | RAM:{ram_mb:.0f}MB | Err:{errors}   ",
                   end="", flush=True)
 
             if self.on_progress:

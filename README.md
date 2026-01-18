@@ -146,8 +146,8 @@ Supports standard NNTPS ports: **563** (default), **443**
 ### From Release (Recommended)
 
 Download from [Releases](https://github.com/5ymph0en1x/DLER/releases):
-- `DLER_v1.2.0.exe` - Ultimate edition with CUDA support
-- `DLER_Basic_v1.2.0.exe` - Lightweight CPU-only edition
+- `DLER_v1.2.1.exe` - Ultimate edition with CUDA support
+- `DLER_Basic_v1.2.1.exe` - Lightweight CPU-only edition
 
 No installation required - standalone executables.
 
@@ -305,6 +305,12 @@ DLER will fall back to CPU-based processing if CuPy is unavailable.
 | par2j64 | 1.3.2.6 | GPL | PAR2 verification/repair |
 
 ## Changelog
+
+### v1.2.1 (2026-01-17)
+- **New:** Matrix-style animated banner for README
+- **New:** Adaptive NNTP pipelining based on RTT measurement
+- **New:** Exponential backoff with jitter for connection retry
+- **Improved:** Connection health monitoring and dynamic pool management
 
 ### v1.2.0 (2026-01-16)
 - **Fixed:** Multi-volume RAR extraction with encrypted headers now works correctly

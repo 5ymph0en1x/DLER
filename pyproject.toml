@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dler"
-version = "1.2.0"
+version = "1.2.1"
 description = "High-performance NZB downloader with elegant TUI for Windows"
 readme = "README.md"
 requires-python = ">=3.11"
