@@ -94,8 +94,7 @@ Supports standard NNTPS ports: **563** (default), **443**.
 
 ## Performance
 
-Measured against a 6.7 GB test release on a 10 Gbps fiber line with a
-100-connection Newshosting account:
+Measured against a 6.7 GB test release on a 10 Gbps fiber line :
 
 | Configuration | Throughput | Notes |
 |---------------|------------|-------|
