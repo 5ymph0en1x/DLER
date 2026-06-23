@@ -47,14 +47,6 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
-# RAM-based processing support
-try:
-    from .ram_processor import RamBuffer
-    HAS_RAM_PROCESSOR = True
-except ImportError:
-    HAS_RAM_PROCESSOR = False
-    RamBuffer = None  # Type hint placeholder
-
 # Incremental verification support
 try:
     from .par2_database import Par2FileDatabase, FileVerificationStatus
@@ -162,7 +154,8 @@ NUMBA_AVAILABLE = _turbo_yenc_mod.NUMBA_AVAILABLE
 # v1.3.0: Import retry and adaptive pipeline classes
 RetryConfig = _fast_nntp_mod.RetryConfig
 AdaptivePipeline = _fast_nntp_mod.AdaptivePipeline
-ConnectionHealth = _fast_nntp_mod.ConnectionHealth
+DynamicConnectionPool = _fast_nntp_mod.DynamicConnectionPool
+PipelineError = _fast_nntp_mod.PipelineError
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +270,14 @@ class DecodedSegment:
 
 
 @dataclass
+class _DownloadWorker:
+    """A live download worker: its thread, connection, and retire signal."""
+    conn: 'NNTPConnection'
+    thread: Optional[threading.Thread] = None
+    retire: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass
 class TurboStatsV2:
     """Real-time statistics."""
     segments_total: int = 0
@@ -323,12 +324,15 @@ class TurboEngineV2:
         write_through: bool = False, # Bypass OS cache
         on_progress: Optional[Callable] = None,
         on_file_complete: Optional[Callable[[Path, str], None]] = None,  # Streaming PAR2 callback
-        ram_buffer: Optional['RamBuffer'] = None,  # RAM-based storage (no disk writes)
         raw_queue_size: int = 16000,   # ~12 GB buffer for raw data
         write_queue_size: int = 8000,  # ~6 GB buffer for decoded data
         incremental_verify: bool = True,  # Enable incremental PAR2 verification
-        retry_config: Optional[RetryConfig] = None,  # v1.3.0: Retry configuration
-        use_adaptive_pipeline: bool = True  # v1.3.0: Enable adaptive pipelining
+        retry_config: Optional[RetryConfig] = None,  # v1.3.0
+        use_adaptive_pipeline: bool = True,          # v1.3.0
+        min_connections: Optional[int] = None,       # v1.3.0 dynamic pool floor
+        max_pipeline_depth: int = 100,               # v1.3.0 AIMD ceiling
+        telemetry: bool = False,                     # diagnostic CSV (or DLER_TELEMETRY=1)
+        benchmark: bool = False,                     # discard decoded data (no disk/RAM) — perf tuning
     ):
         self.server_config = server_config
         self.output_dir = Path(output_dir)
@@ -340,27 +344,53 @@ class TurboEngineV2:
         self.write_through = write_through
         self.on_progress = on_progress
         self.on_file_complete = on_file_complete  # Called when individual file finishes
-        self.ram_buffer = ram_buffer  # If set, write to RAM instead of disk
-        self.ram_mode = ram_buffer is not None
         self.raw_queue_size = raw_queue_size
         self.write_queue_size = write_queue_size
         self.incremental_verify = incremental_verify
 
-        # v1.3.0: Retry and adaptive pipeline configuration
+        # v1.3.0: Retry, adaptive pipeline (throughput-AIMD), dynamic pool
         self.retry_config = retry_config or RetryConfig()
         self.use_adaptive_pipeline = use_adaptive_pipeline
+
+        cap = max(1, server_config.connections)            # provider hard cap
+        self._max_conns = cap
+        floor = 4 if min_connections is None else min_connections
+        self._effective_min_conns = max(1, min(floor, cap))
+
         self._adaptive_pipeline: Optional[AdaptivePipeline] = None
         if use_adaptive_pipeline:
-            self._adaptive_pipeline = AdaptivePipeline(initial_depth=pipeline_depth)
+            self._adaptive_pipeline = AdaptivePipeline(
+                initial_depth=pipeline_depth,
+                max_depth=max(pipeline_depth, max_pipeline_depth),
+            )
+
+        self._dynamic_pool = DynamicConnectionPool(
+            min_connections=self._effective_min_conns,
+            max_connections=cap,
+            target_connections=cap,
+        )
+
+        # Connections + dynamic worker registry + in-flight accounting
+        self._connections: List[NNTPConnection] = []
+        self._needs_reconnect = False
+        self._workers: List["_DownloadWorker"] = []
+        self._workers_lock = threading.Lock()
+        self._inflight = 0
+        self._inflight_lock = threading.Lock()
+        # Diagnostic telemetry (opt-in via DLER_TELEMETRY=1 or telemetry=True):
+        # 1 CSV row/sec to dler_telemetry_<pid>.csv. _put_block_ns accumulates
+        # download-worker time blocked on _raw_queue.put (downstream backpressure).
+        self._telemetry = bool(telemetry) or os.environ.get("DLER_TELEMETRY") == "1"
+        self._put_block_ns = 0
+        self._benchmark = bool(benchmark)
+        self._work_queue: Optional[Queue] = None
+        self._segment_map: Dict[str, NZBSegment] = {}
+        self._next_conn_id = 0
 
         # Incremental verification state
         self._par2_db: Optional['Par2FileDatabase'] = None
         self._verify_queue: Optional['FileVerificationQueue'] = None
         self._verification_enabled = False
-
-        # Connections
-        self._connections: List[NNTPConnection] = []
-        self._needs_reconnect = False  # Force reconnect on next download
 
         # Decoder
         self._decoder = TurboYEncDecoder()
@@ -432,14 +462,9 @@ class TurboEngineV2:
                 conn = future.result()
                 if conn:
                     self._connections.append(conn)
-                    # v1.3.0: Record initial RTT for adaptive pipeline
-                    if self._adaptive_pipeline and conn.avg_rtt_ms > 0:
-                        self._adaptive_pipeline.record_rtt(conn.avg_rtt_ms)
-
-        # v1.3.0: Adjust pipeline depth based on initial RTT measurements
-        if self._adaptive_pipeline and self._connections:
-            new_depth = self._adaptive_pipeline.adjust()
-            logger.info(f"[PIPELINE] Initial depth: {new_depth} (avg RTT: {self._adaptive_pipeline.get_avg_rtt():.1f}ms)")
+                    self._dynamic_pool.add_connection(conn)
+                    with self._workers_lock:
+                        self._next_conn_id = max(self._next_conn_id, conn.conn_id)
 
         print(f"Connected: {len(self._connections)}/{self.server_config.connections}")
         return len(self._connections)
@@ -479,8 +504,14 @@ class TurboEngineV2:
         self._connections.clear()
         print("[ENGINE] Disconnected")
 
-    def download_nzb(self, nzb_path: Path) -> bool:
-        """Download all files from NZB."""
+    def download_nzb(self, nzb_path: Path, only_file_indices: Optional[set] = None) -> bool:
+        """Download all files from NZB.
+
+        only_file_indices: if given, download only the files whose NZB index is
+        in the set. Used by the multiprocess engine to give each process a
+        disjoint shard of files (they write disjoint output files, so no shared
+        memory is needed).
+        """
         # Check if we need to (re)connect
         # Connections may be stale from a previous download
         need_reconnect = self._needs_reconnect
@@ -510,6 +541,14 @@ class TurboEngineV2:
             print("Failed to parse NZB")
             return False
 
+        # Multiprocess sharding: keep only this process's assigned files (their
+        # original .index is preserved, so segment.file_index still resolves).
+        if only_file_indices is not None:
+            files = [f for f in files if f.index in only_file_indices]
+            if not files:
+                logger.info("[SHARD] No files assigned to this shard")
+                return True
+
         # Initialize stats
         self._stats = TurboStatsV2()
         self._stats.files_total = len(files)
@@ -534,7 +573,7 @@ class TurboEngineV2:
         self._par2_db = None
         self._verify_queue = None
 
-        if self.incremental_verify and HAS_VERIFICATION and not self.ram_mode:
+        if self.incremental_verify and HAS_VERIFICATION and not self._benchmark:
             try:
                 # Find PAR2 files in the NZB (case-insensitive)
                 par2_files = [f for f in files if f.filename.lower().endswith('.par2')]
@@ -578,18 +617,21 @@ class TurboEngineV2:
         try:
             # Prepare output files with memory mapping
             # Also initialize progress tracking for progressive finalization
-            logger.info(f"[PREPARE] Preparing {len(files)} files... (RAM mode: {self.ram_mode})")
-            for nzb_file in files:
-                logger.debug(f"[PREPARE] File {nzb_file.index}: '{nzb_file.filename}' ({nzb_file.size} bytes, {len(nzb_file.segments)} segments)")
-                self._prepare_file(nzb_file)
-                # Verify file handle was created
-                if nzb_file.index not in self._file_handles:
-                    logger.error(f"[PREPARE] FAILED to create handle for file {nzb_file.index}: '{nzb_file.filename}'")
-                else:
-                    logger.debug(f"[PREPARE] OK - handle created for file {nzb_file.index}")
-                # Initialize progress tracking: [written, total]
-                self._file_progress[nzb_file.index] = [0, len(nzb_file.segments)]
-                self._file_info[nzb_file.index] = nzb_file
+            if self._benchmark:
+                logger.info("[BENCHMARK] No file prep (decoded data is discarded; zero disk/RAM)")
+            else:
+                logger.info(f"[PREPARE] Preparing {len(files)} files...")
+                for nzb_file in files:
+                    logger.debug(f"[PREPARE] File {nzb_file.index}: '{nzb_file.filename}' ({nzb_file.size} bytes, {len(nzb_file.segments)} segments)")
+                    self._prepare_file(nzb_file)
+                    # Verify file handle was created
+                    if nzb_file.index not in self._file_handles:
+                        logger.error(f"[PREPARE] FAILED to create handle for file {nzb_file.index}: '{nzb_file.filename}'")
+                    else:
+                        logger.debug(f"[PREPARE] OK - handle created for file {nzb_file.index}")
+                    # Initialize progress tracking: [written, total]
+                    self._file_progress[nzb_file.index] = [0, len(nzb_file.segments)]
+                    self._file_info[nzb_file.index] = nzb_file
 
             # Log summary of prepared files
             logger.info(f"[PREPARE] Completed: {len(self._file_handles)} handles created for {len(files)} files")
@@ -601,86 +643,81 @@ class TurboEngineV2:
                 for seg in f.segments:
                     work_queue.put(seg)
                     segment_map[seg.message_id] = seg
+            self._work_queue = work_queue
+            self._segment_map = segment_map
+            with self._inflight_lock:
+                self._inflight = 0
 
-            # === START ALL THREAD POOLS ===
-            raw_buffer_gb = self.raw_queue_size * 750 / 1024 / 1024  # ~750KB per segment
-            write_buffer_gb = self.write_queue_size * 750 / 1024 / 1024
-            logger.info(f"[THREADS] Starting pools: {len(self._connections)} connections, "
-                       f"{self.decoder_threads} decoders, {self.writer_threads} writers")
-            logger.info(f"[BUFFERS] raw_queue={self.raw_queue_size} (~{raw_buffer_gb:.1f}GB), "
-                       f"write_queue={self.write_queue_size} (~{write_buffer_gb:.1f}GB)")
-
-            # 1. Writer threads (start first - consumers)
+            # Writer threads (consumers)
             writer_threads = []
             for i in range(self.writer_threads):
-                t = threading.Thread(
-                    target=self._writer_worker,
-                    name=f"Writer-{i}",
-                    daemon=True
-                )
-                t.start()
-                writer_threads.append(t)
+                t = threading.Thread(target=self._writer_worker, name=f"Writer-{i}", daemon=True)
+                t.start(); writer_threads.append(t)
 
-            # 2. Decoder threads (middle - transform)
+            # Decoder threads
             decoder_threads = []
             for i in range(self.decoder_threads):
-                t = threading.Thread(
-                    target=self._decoder_worker,
-                    name=f"Decoder-{i}",
-                    daemon=True
-                )
-                t.start()
-                decoder_threads.append(t)
+                t = threading.Thread(target=self._decoder_worker, name=f"Decoder-{i}", daemon=True)
+                t.start(); decoder_threads.append(t)
 
-            # 3. Download threads (start last - producers)
-            download_threads = []
-            for i, conn in enumerate(self._connections):
-                t = threading.Thread(
-                    target=self._download_worker,
-                    args=(conn, work_queue, segment_map),
-                    name=f"Download-{i}",
-                    daemon=True
-                )
-                t.start()
-                download_threads.append(t)
-                # Stagger starts for smooth flow
-                if i < len(self._connections) - 1:
+            # Download workers — one per existing connection
+            with self._workers_lock:
+                self._workers = []
+                for conn in list(self._connections):
+                    self._workers.append(_DownloadWorker(conn=conn))
+                workers_snapshot = list(self._workers)
+            for i, w in enumerate(workers_snapshot):
+                t = threading.Thread(target=self._download_worker,
+                                     args=(w, work_queue, segment_map),
+                                     name=f"Download-{w.conn.conn_id}", daemon=True)
+                w.thread = t; t.start()
+                if i < len(workers_snapshot) - 1:
                     time.sleep(0.003)
 
-            # 4. Progress reporter
-            progress_thread = threading.Thread(
-                target=self._progress_reporter,
-                name="Progress",
-                daemon=True
-            )
+            # Controller (depth AIMD + dynamic pool)
+            controller = threading.Thread(target=self._controller_worker, name="Controller", daemon=True)
+            controller.start()
+
+            # Progress reporter
+            progress_thread = threading.Thread(target=self._progress_reporter, name="Progress", daemon=True)
             progress_thread.start()
-            logger.info(f"[THREADS] All pools started: {len(download_threads)} downloaders active")
+            logger.info(f"[THREADS] Pools started: {len(workers_snapshot)} workers, "
+                        f"{self.decoder_threads} decoders, {self.writer_threads} writers")
 
-            # Wait for downloads to complete
-            logger.info(f"[THREADS] Waiting for {len(download_threads)} download threads...")
-            threads_alive = len(download_threads)
-            check_interval = 5  # Check every 5 seconds
-            max_wait = 600  # 10 minutes max
-            waited = 0
+            # Benchmark mode: keep re-queuing the segments so the download runs
+            # continuously (for a fixed measurement window) instead of finishing.
+            if self._benchmark:
+                _bench_segs = list(segment_map.values())
+                def _bench_refill():
+                    while self._running and not self._stop_requested:
+                        with self._workers_lock:
+                            nworkers = max(1, len(self._workers))
+                        if work_queue.qsize() < nworkers * 80:
+                            for s in _bench_segs:
+                                work_queue.put(s)
+                        time.sleep(0.3)
+                threading.Thread(target=_bench_refill, name="BenchRefill", daemon=True).start()
 
-            while threads_alive > 0 and waited < max_wait:
-                time.sleep(check_interval)
-                waited += check_interval
-                threads_alive = sum(1 for t in download_threads if t.is_alive())
+            # Wait for completion: queue drained AND nothing in flight AND workers exited
+            max_wait = 1800
+            waited = 0.0
+            while waited < max_wait and not self._stop_requested:
+                time.sleep(1.0); waited += 1.0
+                with self._workers_lock:
+                    alive = sum(1 for w in self._workers if w.thread and w.thread.is_alive())
+                if self._download_complete(work_queue) and alive == 0:
+                    break
+                if self._download_complete(work_queue):
+                    # queue idle; let stragglers finish their current read
+                    with self._workers_lock:
+                        for w in self._workers:
+                            w.retire.set()
+            logger.info(f"[THREADS] Download phase done in {waited:.0f}s "
+                        f"(inflight={self._inflight}, qsize={work_queue.qsize()})")
 
-                # Log progress with queue status
-                raw_q = self._raw_queue.qsize()
-                write_q = self._write_queue.qsize()
-                raw_pct = raw_q * 100 // self.raw_queue_size if self.raw_queue_size else 0
-                write_pct = write_q * 100 // self.write_queue_size if self.write_queue_size else 0
-                logger.info(f"[PROGRESS] Threads: {threads_alive} active | "
-                           f"Queues: raw={raw_pct}%, write={write_pct}% | "
-                           f"Segments: {self._stats.segments_downloaded}/{self._stats.segments_total}")
-
-            if threads_alive > 0:
-                logger.warning(f"[THREADS] {threads_alive} download threads still alive after {max_wait}s!")
-            else:
-                logger.info(f"[THREADS] All download threads done in {waited}s")
+            # Stop controller
+            self._running = False
+            controller.join(timeout=5)
 
             # Signal decoders to finish (poison pills)
             logger.info("[SHUTDOWN] Sending poison pills to decoders...")
@@ -799,90 +836,229 @@ class TurboEngineV2:
             self._verification_enabled = False
             return False
 
-    def _download_worker(
-        self,
-        conn: NNTPConnection,
-        work_queue: Queue[NZBSegment],
-        segment_map: Dict[str, NZBSegment]
-    ) -> None:
-        """
-        Download worker - ONLY network I/O.
+    def _download_worker(self, worker: '_DownloadWorker', work_queue: Queue,
+                         segment_map: Dict[str, NZBSegment]) -> None:
+        """Network I/O worker: stream bodies via a live, adjustable pipeline.
 
-        Fetches raw data and puts it in raw_queue.
-        Never touches disk, never decodes.
-
-        v1.3.0: Uses adaptive pipeline depth based on RTT measurements.
+        Reconnects and continues on a pipeline desync (in-flight ids already
+        requeued by fetch_streaming). Retires gracefully when worker.retire is
+        set (scale-down).
         """
-        local_bytes = 0
-        local_segs = 0
-        local_errors = 0
-        update_counter = 0
-        rtt_update_counter = 0
+        conn = worker.conn
+        local = {"bytes": 0, "segs": 0, "errors": 0, "n": 0, "put_block": 0.0}
+        telem = self._telemetry
 
         def get_next_id():
             try:
                 seg = work_queue.get_nowait()
-                return seg.message_id
             except Empty:
                 return None
+            self._inflight_inc()
+            return seg.message_id
 
         def on_data(msg_id: str, data: Optional[bytes]):
-            nonlocal local_bytes, local_segs, local_errors, update_counter, rtt_update_counter
-
+            self._inflight_dec()
             segment = segment_map.get(msg_id)
             if segment and data:
-                local_bytes += len(data)
-                local_segs += 1
-                # Put in raw queue (may block if queue full - backpressure)
-                self._raw_queue.put((segment, data))
+                local["bytes"] += len(data)
+                local["segs"] += 1
+                if telem:
+                    # Time spent blocked here = downstream (decode/disk) backpressure.
+                    _t0 = time.perf_counter()
+                    self._raw_queue.put((segment, data))
+                    local["put_block"] += time.perf_counter() - _t0
+                else:
+                    self._raw_queue.put((segment, data))
             else:
-                local_errors += 1
-
-            work_queue.task_done()
-            update_counter += 1
-            rtt_update_counter += 1
-
-            # v1.3.0: Record RTT samples and adjust pipeline periodically
-            if self._adaptive_pipeline and rtt_update_counter >= 10:
-                if conn.avg_rtt_ms > 0:
-                    self._adaptive_pipeline.record_rtt(conn.avg_rtt_ms)
-                    self._adaptive_pipeline.adjust()
-                rtt_update_counter = 0
-
-            # Update stats frequently for smooth display
-            if update_counter >= 5:
+                local["errors"] += 1
+            local["n"] += 1
+            if local["n"] >= 5:
                 with self._lock:
-                    self._stats.bytes_downloaded += local_bytes
-                    self._stats.segments_downloaded += local_segs
-                    self._stats.errors += local_errors
-                local_bytes = 0
-                local_segs = 0
-                local_errors = 0
-                update_counter = 0
+                    self._stats.bytes_downloaded += local["bytes"]
+                    self._stats.segments_downloaded += local["segs"]
+                    self._stats.errors += local["errors"]
+                    if telem:
+                        self._put_block_ns += int(local["put_block"] * 1e9)
+                local["bytes"] = local["segs"] = local["errors"] = local["n"] = 0
+                local["put_block"] = 0.0
 
-        # v1.3.0: Get pipeline depth from adaptive pipeline or use fixed value
-        pipeline_depth = self._adaptive_pipeline.depth if self._adaptive_pipeline else self.pipeline_depth
+        def requeue(ids):
+            for mid in ids:
+                seg = segment_map.get(mid)
+                if seg is not None:
+                    work_queue.put(seg)
+            self._inflight_dec(len(ids))
 
-        # Use streaming fetch - this blocks until queue is empty
-        # Pass pause_event and stop_flag for immediate pause/stop response
+        def on_result(success: bool, rt_ms: float):
+            self._dynamic_pool.record_result(conn.conn_id, success, rt_ms)
+
+        def depth_provider():
+            if self._adaptive_pipeline:
+                return self._adaptive_pipeline.depth
+            return self.pipeline_depth
+
         try:
-            logger.debug(f"{threading.current_thread().name}: Starting fetch_streaming (pipeline={pipeline_depth})")
-            conn.fetch_streaming(
-                get_next_id,
-                on_data,
-                pipeline_depth,
-                pause_event=self._pause_event,
-                stop_flag=lambda: self._stop_requested
-            )
-            logger.debug(f"{threading.current_thread().name}: fetch_streaming completed")
-        except Exception as e:
-            logger.error(f"{threading.current_thread().name}: fetch_streaming error: {e}")
+            while not self._stop_requested and not worker.retire.is_set():
+                try:
+                    conn.fetch_streaming(
+                        get_next_id, on_data, depth_provider, requeue,
+                        pause_event=self._pause_event,
+                        stop_flag=lambda: self._stop_requested,
+                        on_result=on_result,
+                        retire_flag=lambda: worker.retire.is_set(),
+                    )
+                    break  # normal return: queue drained, or stop/retire requested
+                except PipelineError as e:
+                    if self._stop_requested or worker.retire.is_set():
+                        break
+                    logger.warning(f"{threading.current_thread().name}: "
+                                   f"pipeline desync, reconnecting: {e}")
+                    if not conn.connect():
+                        logger.error(f"{threading.current_thread().name}: "
+                                     f"reconnect failed; retiring connection")
+                        break
+        finally:
+            # flush remaining local stats (incl. telemetry put-block time)
+            with self._lock:
+                self._stats.bytes_downloaded += local["bytes"]
+                self._stats.segments_downloaded += local["segs"]
+                self._stats.errors += local["errors"]
+                if telem:
+                    self._put_block_ns += int(local["put_block"] * 1e9)
+            self._dynamic_pool.remove_connection(conn.conn_id)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._workers_lock:
+                if worker in self._workers:
+                    self._workers.remove(worker)
+                if conn in self._connections:
+                    self._connections.remove(conn)
 
-        # Final update
-        with self._lock:
-            self._stats.bytes_downloaded += local_bytes
-            self._stats.segments_downloaded += local_segs
-            self._stats.errors += local_errors
+    def _inflight_inc(self) -> None:
+        with self._inflight_lock:
+            self._inflight += 1
+
+    def _inflight_dec(self, n: int = 1) -> None:
+        with self._inflight_lock:
+            self._inflight -= n
+
+    def _spawn_worker(self) -> bool:
+        """Create + connect a new connection and start a worker for it."""
+        with self._workers_lock:
+            if len(self._workers) >= self._max_conns:
+                return False
+            self._next_conn_id += 1
+            cid = self._next_conn_id
+        # connect() is blocking network I/O -> do it WITHOUT holding the lock
+        conn = NNTPConnection(self.server_config, cid, retry_config=self.retry_config)
+        if not conn.connect():
+            return False
+        worker = _DownloadWorker(conn=conn)
+        t = threading.Thread(target=self._download_worker,
+                             args=(worker, self._work_queue, self._segment_map),
+                             name=f"Download-{cid}", daemon=True)
+        worker.thread = t
+        # Re-check the cap and register atomically (guards the connect() window)
+        with self._workers_lock:
+            if len(self._workers) >= self._max_conns:
+                conn.close()
+                return False
+            self._connections.append(conn)
+            self._dynamic_pool.add_connection(conn)
+            self._workers.append(worker)
+            nconn = len(self._workers)
+        t.start()
+        logger.info(f"[POOL] Scaled up: +1 connection (now {nconn})")
+        return True
+
+    def _retire_dead_workers(self) -> int:
+        """Retire workers whose connection the health tracker has marked DEAD.
+
+        They drain and exit; backlog-driven scale-up replaces them (bounded by
+        the provider cap). Returns the number newly retired.
+        """
+        dead = set(self._dynamic_pool.dead_conn_ids())
+        if not dead:
+            return 0
+        retired = 0
+        with self._workers_lock:
+            for w in self._workers:
+                if w.conn.conn_id in dead and not w.retire.is_set():
+                    w.retire.set()
+                    retired += 1
+        if retired:
+            logger.info(f"[POOL] Retiring {retired} unhealthy connection(s)")
+        return retired
+
+    def _apply_scale(self, rec: int) -> None:
+        if rec > 0:
+            for _ in range(rec):
+                if not self._spawn_worker():
+                    break
+        elif rec < 0:
+            n = -rec
+            with self._workers_lock:
+                # retire the most recently added, non-retired workers
+                for w in reversed(self._workers):
+                    if n <= 0:
+                        break
+                    if not w.retire.is_set():
+                        w.retire.set()
+                        n -= 1
+            logger.info(f"[POOL] Scaled down: retiring {(-rec) - n} connection(s)")
+
+    def _controller_worker(self) -> None:
+        """Adapt depth (fast, throughput-AIMD) and pool size (slow, backlog+health)."""
+        tick = 0.5
+        depth_interval = 1.5
+        pool_interval = 10.0
+        next_depth = depth_interval
+        next_pool = pool_interval
+        elapsed = 0.0
+        prev_dl = 0
+        prev_err = 0
+
+        while self._running and not self._stop_requested:
+            self._pause_event.wait()
+            time.sleep(tick)
+            elapsed += tick
+
+            if self._adaptive_pipeline and elapsed >= next_depth:
+                next_depth = elapsed + depth_interval
+                with self._lock:
+                    dl = self._stats.segments_downloaded
+                    err = self._stats.errors
+                d_dl = dl - prev_dl
+                d_err = err - prev_err
+                prev_dl, prev_err = dl, err
+                err_rate = (d_err / (d_dl + d_err)) if (d_dl + d_err) > 0 else 0.0
+                self._adaptive_pipeline.record_throughput(self._speed_tracker.speed_mbps)
+                self._adaptive_pipeline.adjust(error_rate=err_rate)
+
+            if elapsed >= next_pool and self._work_queue is not None:
+                next_pool = elapsed + pool_interval
+                # Rotate out connections the health tracker marked DEAD;
+                # backlog-driven scale-up replaces them on a later tick.
+                self._retire_dead_workers()
+                backlog = self._work_queue.qsize()
+                with self._workers_lock:
+                    active = len(self._workers)
+                rec = self._dynamic_pool.get_scale_recommendation(backlog, active)
+                # Don't pile new connections onto a struggling server.
+                if rec > 0 and self._dynamic_pool.healthy_count() < active // 2:
+                    rec = 0
+                if rec != 0:
+                    self._apply_scale(rec)
+                    if self._adaptive_pipeline:
+                        self._adaptive_pipeline.reset_baseline()
+                logger.debug(f"[POOL] {self._dynamic_pool.get_pool_status()}")
+
+    def _download_complete(self, work_queue: Queue) -> bool:
+        """Done when nothing queued and nothing dispensed-but-unresolved."""
+        with self._inflight_lock:
+            return work_queue.empty() and self._inflight == 0
 
     def _decoder_worker(self) -> None:
         """
@@ -1014,6 +1190,19 @@ class TurboEngineV2:
             if item is None:
                 break
 
+            # Benchmark mode: discard decoded data (no disk, no RAM), count only.
+            if self._benchmark:
+                local_bytes += len(item.data)
+                local_segs += 1
+                update_counter += 1
+                if update_counter >= 50:
+                    with self._lock:
+                        self._stats.bytes_written += local_bytes
+                        self._stats.segments_written += local_segs
+                    local_bytes = local_segs = update_counter = 0
+                del item
+                continue
+
             try:
                 file_idx = item.file_index
 
@@ -1053,26 +1242,7 @@ class TurboEngineV2:
                     continue
 
                 if pos + data_len <= file_size:
-                    if self.ram_mode:
-                        # === RAM MODE: Write to BytesIO buffer ===
-                        # MUST use lock - BytesIO is not thread-safe for concurrent seek+write
-                        ram_file = handle[0]  # RamFile object
-
-                        # Debug: Log first segment write for each file (pos=0)
-                        if pos == 0:
-                            first_bytes = data[:16].hex() if len(data) >= 16 else data.hex()
-                            logger.debug(f"[RAM WRITE] file_idx={file_idx} pos=0 len={data_len} "
-                                        f"first_16={first_bytes} filename={ram_file.filename}")
-
-                        with self._file_locks[file_idx]:
-                            ram_file.data.seek(pos)
-                            ram_file.data.write(data)
-                            # Track actual bytes written (max position reached)
-                            ram_file.update_actual_size(pos, data_len)
-                        local_bytes += data_len
-                        local_segs += 1
-                        # No flush needed for RAM
-                    elif self.write_through:
+                    if self.write_through:
                         # WriteThrough mode: direct file write (DyMaxIO compatible)
                         f = handle[0]
                         with self._file_locks[file_idx]:
@@ -1146,6 +1316,30 @@ class TurboEngineV2:
         time.sleep(0.5)
 
         gc_counter = 0
+
+        # --- Diagnostic telemetry: one CSV row/sec to dler_telemetry_<pid>.csv ---
+        telem_writer = None
+        telem_file = None
+        if self._telemetry:
+            import csv as _csv
+            telem_path = f"dler_telemetry_{os.getpid()}.csv"
+            try:
+                telem_file = open(telem_path, "w", newline="", encoding="utf-8")
+                telem_writer = _csv.writer(telem_file)
+                telem_writer.writerow([
+                    "t_s", "speed_mbps", "depth", "conns", "max_conns",
+                    "raw_q", "raw_max", "write_q", "write_max",
+                    "dl_segs_s", "dec_segs_s", "wr_segs_s", "errors", "put_block_pct",
+                ])
+                logger.info(f"[TELEM] writing {os.path.abspath(telem_path)}")
+            except Exception as e:
+                logger.warning(f"[TELEM] could not open telemetry file: {e}")
+                telem_writer = None
+        telem_t0 = time.time()
+        telem_next = telem_t0 + 1.0
+        telem_prev_dl = telem_prev_dec = telem_prev_wr = telem_prev_put = 0
+        telem_prev_t = telem_t0
+
         while self._running:
             time.sleep(0.1)  # Update more frequently for smoother display
 
@@ -1186,23 +1380,59 @@ class TurboEngineV2:
             # Get RAM usage
             ram_mb = get_process_memory_mb()
 
-            # v1.3.0: Show adaptive pipeline depth
             pipe_info = ""
             if self._adaptive_pipeline:
                 pipe_depth = self._adaptive_pipeline.depth
-                avg_rtt = self._adaptive_pipeline.get_avg_rtt()
-                if avg_rtt:
-                    pipe_info = f" | P:{pipe_depth}@{avg_rtt:.0f}ms"
-                else:
-                    pipe_info = f" | P:{pipe_depth}"
+                with self._workers_lock:
+                    nconn = len(self._workers)
+                pipe_info = f" | P:{pipe_depth} C:{nconn}/{self._max_conns}"
 
             print(f"\r[{percent:5.1f}%] {speed:7.1f} MB/s | "
                   f"DL:{dl_segs} -> Dec:{dec_segs} -> Wr:{wr_segs}/{total} | "
                   f"Q[{raw_q}/{write_q}]{pipe_info} | RAM:{ram_mb:.0f}MB | Err:{errors}   ",
                   end="", flush=True)
 
+            # --- Telemetry row (rate-limited to ~1/s) ---
+            if telem_writer is not None:
+                now = time.time()
+                if now >= telem_next:
+                    telem_next = now + 1.0
+                    dt = now - telem_prev_t
+                    with self._inflight_lock:
+                        put_ns = self._put_block_ns
+                    with self._workers_lock:
+                        nconn = len(self._workers)
+                    depth = (self._adaptive_pipeline.depth
+                             if self._adaptive_pipeline else self.pipeline_depth)
+                    if dt > 0:
+                        dl_rate = (dl_segs - telem_prev_dl) / dt
+                        dec_rate = (dec_segs - telem_prev_dec) / dt
+                        wr_rate = (wr_segs - telem_prev_wr) / dt
+                        # % of a worker-second spent blocked on raw_queue.put (downstream backpressure)
+                        put_pct = ((put_ns - telem_prev_put) / 1e9) / (dt * max(1, nconn)) * 100
+                    else:
+                        dl_rate = dec_rate = wr_rate = put_pct = 0
+                    try:
+                        telem_writer.writerow([
+                            f"{now - telem_t0:.1f}", f"{speed:.1f}", depth, nconn, self._max_conns,
+                            raw_q, self.raw_queue_size, write_q, self.write_queue_size,
+                            f"{dl_rate:.0f}", f"{dec_rate:.0f}", f"{wr_rate:.0f}", errors,
+                            f"{put_pct:.1f}",
+                        ])
+                        telem_file.flush()
+                    except Exception:
+                        pass
+                    telem_prev_dl, telem_prev_dec, telem_prev_wr, telem_prev_put, telem_prev_t = \
+                        dl_segs, dec_segs, wr_segs, put_ns, now
+
             if self.on_progress:
                 self.on_progress(self._stats)
+
+        if telem_file is not None:
+            try:
+                telem_file.close()
+            except Exception:
+                pass
 
     def _parse_nzb(self, nzb_path: Path) -> List[NZBFile]:
         """Parse NZB file."""
@@ -1272,7 +1502,7 @@ class TurboEngineV2:
         return files
 
     def _prepare_file(self, nzb_file: NZBFile) -> None:
-        """Prepare output file for writing (disk or RAM mode)."""
+        """Prepare output file for writing (disk)."""
         try:
             # Handle empty filename
             if not nzb_file.filename or not nzb_file.filename.strip():
@@ -1281,26 +1511,6 @@ class TurboEngineV2:
             else:
                 safe_name = "".join(c if c.isalnum() or c in '.-_' else '_'
                                    for c in nzb_file.filename)
-
-            # === RAM MODE: Store in memory instead of disk ===
-            if self.ram_mode and self.ram_buffer is not None:
-                # Use unique key with file index to avoid collisions when NZB has duplicate names
-                # (common with obfuscated releases where all files have same subject)
-                ram_key = f"{safe_name}__idx{nzb_file.index:04d}"
-
-                # Store filename for later (original name without index suffix)
-                self._file_paths[nzb_file.index] = Path(safe_name)  # Virtual path (just the name)
-
-                # Create RAM buffer for this file with unique key
-                # Pass safe_name as display_name so ram_file.filename has the clean name
-                ram_file = self.ram_buffer.create_file(ram_key, max(nzb_file.size, 1), display_name=safe_name)
-                if ram_file:
-                    # Store reference: [ram_file, ram_key, size, write_count]
-                    self._file_handles[nzb_file.index] = [ram_file, ram_key, nzb_file.size, 0]
-                    self._file_locks[nzb_file.index] = threading.Lock()
-                else:
-                    logger.error(f"[RAM] Failed to create buffer for {ram_key}")
-                return  # Skip disk file creation
 
             # Ensure safe_name is not empty after sanitization
             if not safe_name or not safe_name.strip():
@@ -1407,12 +1617,7 @@ class TurboEngineV2:
         if file_idx in self._file_handles:
             handle = self._file_handles[file_idx]
             try:
-                if self.ram_mode:
-                    # RAM mode: no disk operations needed
-                    # Data stays in RamBuffer, just clean up tracking
-                    ram_file = handle[0]
-                    logger.debug(f"[FINALIZE-RAM] File complete: {ram_file.filename} ({ram_file.size} bytes)")
-                elif self.write_through:
+                if self.write_through:
                     # WriteThrough mode: just close file handle
                     f = handle[0]
                     f.flush()
@@ -1473,47 +1678,24 @@ class TurboEngineV2:
                 safe_name = "".join(c if c.isalnum() or c in '.-_() ' else '_'
                                    for c in yenc_name)
 
-                if self.ram_mode and self.ram_buffer is not None:
-                    # RAM mode: update filename in RamBuffer
-                    try:
-                        # Get the actual RAM key from _file_handles (includes index suffix)
-                        if file_idx in self._file_handles:
-                            old_name = self._file_handles[file_idx][1]  # ram_key with index
-                        else:
-                            old_name = str(old_path)
-                        ram_file = self.ram_buffer.get_file(old_name)
-                        if ram_file:
-                            # Update the filename in place
-                            ram_file.filename = safe_name
-                            # Move to new key in the buffer dict
-                            self.ram_buffer._files[safe_name] = ram_file
-                            if old_name in self.ram_buffer._files:
-                                del self.ram_buffer._files[old_name]
-                            # Update both references
-                            self._file_paths[file_idx] = Path(safe_name)
-                            self._file_handles[file_idx][1] = safe_name  # Update handle reference
-                            logger.info(f"Renamed (RAM): {old_name} -> {safe_name}")
-                    except Exception as e:
-                        logger.warning(f"Failed to rename in RAM {old_path}: {e}")
-                else:
-                    # Disk mode: rename file on filesystem
-                    new_path = self.output_dir / safe_name
-                    try:
-                        # Handle duplicate names
-                        if new_path.exists() and new_path != old_path:
-                            base = new_path.stem
-                            ext = new_path.suffix
-                            counter = 1
-                            while new_path.exists():
-                                new_path = self.output_dir / f"{base}_{counter}{ext}"
-                                counter += 1
+                # Rename file on filesystem
+                new_path = self.output_dir / safe_name
+                try:
+                    # Handle duplicate names
+                    if new_path.exists() and new_path != old_path:
+                        base = new_path.stem
+                        ext = new_path.suffix
+                        counter = 1
+                        while new_path.exists():
+                            new_path = self.output_dir / f"{base}_{counter}{ext}"
+                            counter += 1
 
-                        if old_path.exists():
-                            old_path.rename(new_path)
-                            self._file_paths[file_idx] = new_path
-                            logger.info(f"Renamed: {old_path.name} -> {new_path.name}")
-                    except Exception as e:
-                        logger.warning(f"Failed to rename {old_path.name}: {e}")
+                    if old_path.exists():
+                        old_path.rename(new_path)
+                        self._file_paths[file_idx] = new_path
+                        logger.info(f"Renamed: {old_path.name} -> {new_path.name}")
+                except Exception as e:
+                    logger.warning(f"Failed to rename {old_path.name}: {e}")
 
         self._stats.files_completed += 1
 
@@ -1522,12 +1704,7 @@ class TurboEngineV2:
         if self.on_file_complete:
             try:
                 file_path = self._file_paths.get(file_idx)
-                if self.ram_mode:
-                    # RAM mode: pass virtual path (filename only)
-                    if file_path:
-                        self.on_file_complete(file_path, nzb_file.filename)
-                elif file_path and file_path.exists():
-                    # Disk mode: pass real path
+                if file_path and file_path.exists():
                     self.on_file_complete(file_path, nzb_file.filename)
             except Exception as e:
                 logger.debug(f"on_file_complete callback error: {e}")

@@ -52,20 +52,6 @@ try:
 except ImportError:
     TkinterDnD = None
 
-HAS_RAM_PROCESSOR = False
-try:
-    # Test NumPy first - Python 3.14 has compatibility issues
-    import numpy as np
-    _test = np.array([1, 2, 3])  # Simple test to trigger any delayed errors
-    del _test
-
-    from ..core.ram_processor import RamBuffer, RamPostProcessor
-    HAS_RAM_PROCESSOR = True
-except (ImportError, TypeError, Exception) as e:
-    # TypeError can occur with Python 3.14 + NumPy/CuPy (add_docstring bug)
-    HAS_RAM_PROCESSOR = False
-    logging.getLogger(__name__).warning(f"RAM processor not available: {e}")
-
 # Adaptive Extractor for intelligent NZB classification
 HAS_ADAPTIVE_EXTRACTOR = False
 try:
@@ -75,27 +61,7 @@ try:
 except ImportError as e:
     logging.getLogger(__name__).debug(f"Adaptive extractor not available: {e}")
 
-# Edition detection (set by runtime hook in PyInstaller build)
-# Ultimate = GPU/CUDA support, Basic = CPU-only
 import os
-IS_ULTIMATE_EDITION = os.environ.get('DLER_EDITION', 'ultimate').lower() == 'ultimate'
-
-# CuPy/CUDA detection for GPU acceleration (only in Ultimate edition)
-HAS_CUDA = False
-_cuda_error = None
-if IS_ULTIMATE_EDITION:
-    try:
-        import cupy as cp
-        device_count = cp.cuda.runtime.getDeviceCount()
-        if device_count > 0:
-            HAS_CUDA = True
-            logging.getLogger(__name__).info(f"CUDA detected: {device_count} device(s)")
-    except ImportError as e:
-        _cuda_error = f"CuPy import failed: {e}"
-        logging.getLogger(__name__).warning(_cuda_error)
-    except Exception as e:
-        _cuda_error = f"CUDA detection failed: {e}"
-        logging.getLogger(__name__).warning(_cuda_error)
 
 logger = logging.getLogger(__name__)
 
@@ -183,9 +149,15 @@ class DLERApp:
         self._speed_graph = None  # Speed graph widget
         self._system_tray: Optional[SystemTrayManager] = None  # System tray manager
         self._start_minimized = start_minimized  # Start minimized to tray
+        self._watch_folder = None
+        self._last_pp_result = None
+        self._stop_requested = False        # user pressed STOP — abort all stages
+        self._mp_stop_event = None          # multiprocessing Event to stop MP child procs
+        self._active_processor = None       # currently-running PostProcessor (for STOP)
 
         self._setup_ui()
         self._load_config()
+        self._start_watch_folder()
         self._setup_system_tray()
         # Setup drag-and-drop AFTER system tray (they conflict - windnd vs pystray)
         self._setup_drag_and_drop()
@@ -665,7 +637,17 @@ class DLERApp:
             font=FONT_VALUE_SMALL,
             wrap="none",
             state="disabled",
-            cursor="arrow"
+            cursor="arrow",
+            # tk.Text is not ttk-themed: set dark colors explicitly so it doesn't
+            # render as a white box inside the park-dark interface (#313131 panels).
+            bg="#262626",
+            fg="#d4d4d4",
+            insertbackground="#eeeeee",
+            selectbackground="#2d9254",
+            selectforeground="#ffffff",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
         )
         self._log_text.grid(row=0, column=0, sticky="nsew")
 
@@ -794,6 +776,7 @@ class DLERApp:
         self._queue_info_var.set("Settings saved")
         if self._turbo_engine and not self._state.is_downloading:
             self._turbo_engine = None
+        self._start_watch_folder()
 
     def _add_nzb(self) -> None:
         """Add NZB files."""
@@ -826,6 +809,67 @@ class DLERApp:
         else:
             self._queue_info_var.set(f"{count} files in queue")
 
+    def _start_watch_folder(self) -> None:
+        """(Re)start the watchfolder from current config."""
+        self._stop_watch_folder()
+        wf = getattr(self._config, "watchfolder", None)
+        if not wf or not wf.enabled or not wf.folder:
+            return
+        try:
+            from ..core.watch_folder import WatchFolder
+            self._watch_folder = WatchFolder(wf.folder, on_nzb=self._on_watch_nzb,
+                                             poll_interval_s=wf.poll_interval_s)
+            self._watch_folder.start()
+        except Exception as e:
+            logger.warning(f"[WATCH] could not start: {e}")
+
+    def _stop_watch_folder(self) -> None:
+        if self._watch_folder:
+            try:
+                self._watch_folder.stop()
+            except Exception:
+                pass
+            self._watch_folder = None
+
+    def _on_watch_nzb(self, path) -> None:
+        """Called from the watchfolder thread; marshal to the Tk thread."""
+        def _add():
+            from pathlib import Path as _P
+            p = _P(path)
+            self._download_queue.append(p)
+            self._update_queue_info()
+            self._log(f"Watchfolder: queued {p.name}", "info")
+            auto = getattr(self._config.watchfolder, "auto_start", True)
+            if auto and not self._state.is_downloading:
+                self._start_next_download()
+        self._master.after_idle(_add)
+
+    def _build_script_context(self, release, nzb, output_dir, extract_dir,
+                              success, repaired, files_extracted, download_bytes,
+                              duration_s=0.0, segments_done=0, segments_total=0,
+                              connections=0, num_processes=1) -> dict:
+        dur = float(duration_s or 0)
+        avg = (int(download_bytes or 0) / dur / 1e6) if dur > 0 else 0.0
+        return {"release": release, "nzb": str(nzb or ""), "output_dir": str(output_dir or ""),
+                "extract_dir": str(extract_dir or ""), "success": bool(success),
+                "repaired": bool(repaired), "files_extracted": int(files_extracted or 0),
+                "download_bytes": int(download_bytes or 0),
+                "duration_s": int(dur), "avg_speed_mbps": round(avg, 1),
+                "segments_done": int(segments_done or 0), "segments_total": int(segments_total or 0),
+                "connections": int(connections or 0), "num_processes": int(num_processes or 1)}
+
+    def _fire_post_script(self, context: dict) -> None:
+        ps = getattr(self._config, "post_script", None)
+        if not ps or not ps.enabled or not ps.command.strip():
+            return
+        try:
+            from ..core.post_script import run_post_script
+            self._log("Running post-process script...", "info")
+            ok, msg = run_post_script(ps.command, context, timeout_s=ps.timeout_s)
+            self._log(f"Post-script: {msg}", "success" if ok else "warning")
+        except Exception as e:
+            logger.warning(f"[POST-SCRIPT] error: {e}")
+
     def _start_next_download(self) -> None:
         """Start next download."""
         if not self._download_queue:
@@ -847,9 +891,10 @@ class DLERApp:
         self._stop_btn.config(state="normal")
         self._pause_btn.config(state="normal")
 
-        # Reset speed graph for new download
+        # Reset speed graph + the GUI-side speed smoother for the new download
         if self._speed_graph:
             self._speed_graph.reset()
+        self._gui_speed = None
 
         # Log download start
         self._log(f"Starting: {nzb_path.name}", "info")
@@ -859,6 +904,8 @@ class DLERApp:
 
     def _download_thread(self, nzb_path: Path) -> None:
         """Background download."""
+        self._stop_requested = False        # fresh download — clear any prior STOP
+        self._active_processor = None
         streaming_pp = None  # Streaming post-processor for early PAR2
         streaming_extractor = None  # Streaming RAR extractor
         direct_to_destination = False  # True if downloading directly to final location
@@ -868,6 +915,7 @@ class DLERApp:
         extraction_plan = None  # Adaptive extraction plan (set by classifier)
 
         try:
+            self._last_pp_result = None
             if self._turbo_engine is None:
                 self._init_engine()
 
@@ -1017,47 +1065,96 @@ class DLERApp:
 
             self._parse_nzb_size(nzb_path)
 
-            # === RAM PROCESSING MODE ===
-            ram_buffer = None
-            use_ram_mode = False
-            if (HAS_RAM_PROCESSOR and
-                self._config and
-                self._config.ram_processing.enabled):
-                # Check if NZB fits in RAM limit
-                nzb_size_mb = self._state.total_bytes / (1024 * 1024)
-                max_ram_mb = self._config.ram_processing.max_size_mb
-
-                if nzb_size_mb <= max_ram_mb:
-                    try:
-                        ram_buffer = RamBuffer(max_size_mb=max_ram_mb)
-                        use_ram_mode = True
-                        logger.info(f"[RAM MODE] Enabled: {nzb_size_mb:.0f} MB fits in {max_ram_mb} MB limit")
-                        logger.info(f"[RAM MODE] GPU repair: {self._config.ram_processing.gpu_repair}")
-
-                        # Configure engine for RAM mode
-                        self._turbo_engine.ram_buffer = ram_buffer
-                        self._turbo_engine.ram_mode = True
-                    except Exception as e:
-                        logger.warning(f"[RAM MODE] Failed to initialize: {e}")
-                        ram_buffer = None
-                        use_ram_mode = False
-                else:
-                    logger.info(f"[RAM MODE] Skipped: {nzb_size_mb:.0f} MB exceeds {max_ram_mb} MB limit")
-
             self._queue_info_var.set(f"Downloading...")
             logger.info(f"Starting: {nzb_path}")
 
             start_time = time.time()
-            success = self._turbo_engine.download_nzb(nzb_path)
+            used_multiprocess = False
+            if getattr(self._config.turbo, "use_multiprocess", False):
+                used_multiprocess = True
+                # Opt-in multiprocess (disk mode): shard files across processes to
+                # escape the GIL. Adapts the aggregate stats dict to the existing
+                # progress display via a lightweight stats object.
+                from ..core.mp_engine import download_multiprocess
+                from ..core.turbo_engine_v2 import TurboStatsV2
+
+                def _mp_progress(agg):
+                    try:
+                        st = TurboStatsV2()
+                        st.bytes_downloaded = agg.get("bytes_downloaded", 0)
+                        st.bytes_written = agg.get("bytes_downloaded", 0)
+                        st.segments_downloaded = agg.get("segments_downloaded", 0)
+                        st.segments_total = agg.get("segments_total", 0)
+                        st.segments_written = agg.get("segments_downloaded", 0)
+                        st.errors = agg.get("errors", 0)
+                        st.start_time = start_time
+                        self._on_progress(st)
+                        # The main engine is idle in MP mode, so _on_progress read
+                        # 0 connections/queues from it. Override with the real
+                        # per-child totals the workers report through the shared array.
+                        self._state.connections_active = agg.get("connections", 0)
+                        self._state.connections_total = getattr(
+                            self._config.server, "connections", self._state.connections_active)
+                        self._state.queue_raw = agg.get("raw_queue", 0)
+                        self._state.queue_write = agg.get("write_queue", 0)
+                    except Exception:
+                        pass
+
+                # CRITICAL: in MP mode the main engine does NOT download — but
+                # _init_engine() already opened a full set of connections on it.
+                # Those idle connections still count against the provider's
+                # per-account cap, leaving no budget for the child processes
+                # (main 100 + children ~100 > 100 cap → children are refused and
+                # the download stalls / freezes). Release them so the children
+                # own the entire connection budget.
+                mp_server_config = self._turbo_engine.server_config
+                mp_output_dir = self._turbo_engine.output_dir
+                try:
+                    self._turbo_engine.disconnect()
+                    logger.info("[MP] Released main-engine connections so child processes own the full budget")
+                except Exception as e:
+                    logger.debug(f"[MP] main-engine disconnect skipped: {e}")
+
+                # Stop handle so the STOP button can terminate the child processes.
+                import multiprocessing as _mp
+                self._mp_stop_event = _mp.get_context("spawn").Event()
+                success = download_multiprocess(
+                    nzb_path,
+                    mp_server_config,
+                    mp_output_dir,
+                    num_processes=getattr(self._config.turbo, "num_processes", 0),
+                    turbo_kwargs={
+                        "pipeline_depth": self._config.turbo.pipeline_depth,
+                        "writer_threads": self._config.turbo.writer_threads,
+                        "write_through": self._config.turbo.write_through,
+                        "use_adaptive_pipeline": self._config.turbo.use_adaptive_pipeline,
+                        "max_pipeline_depth": self._config.turbo.max_pipeline_depth,
+                    },
+                    progress_cb=_mp_progress,
+                    stop_event=self._mp_stop_event,
+                )
+                self._mp_stop_event = None
+            else:
+                success = self._turbo_engine.download_nzb(nzb_path)
             elapsed = time.time() - start_time
+
+            # User pressed STOP during the download → do NOT start post-processing
+            # (which would otherwise kick off PAR2 repair on the partial download).
+            if self._stop_requested:
+                logger.info("[STOP] Download aborted by user — skipping post-processing")
+                return
 
             # Mark download as complete BEFORE setting final values
             # This prevents progress callback from overwriting
             self._download_complete = True
 
             if success:
-                # Get final stats from engine
-                if self._turbo_engine:
+                # Get final stats from engine.
+                # In MP mode the main engine's _stats are EMPTY (the child processes
+                # did the downloading); the real totals are already aggregated into
+                # self._state by _mp_progress/_on_progress, so don't overwrite them
+                # with the main engine's zeros (that produced "0.00 GB ... 0.0 MB/s").
+                if self._turbo_engine and not used_multiprocess:
                     final_stats = self._turbo_engine._stats
                     self._state.downloaded_bytes = final_stats.bytes_written
                     self._state.segments_done = final_stats.segments_written
@@ -1114,101 +1211,38 @@ class DLERApp:
                     logger.info(f"Postprocess enabled: {self._config.postprocess.enabled}")
 
                 if self._config and self._config.postprocess.enabled:
-                    # === RAM MODE POST-PROCESSING ===
-                    if use_ram_mode and ram_buffer and HAS_RAM_PROCESSOR:
-                        try:
-                            logger.info("[RAM MODE] Starting GPU-accelerated post-processing...")
-                            self._log("RAM post-processing...", "info")
-                            self._queue_info_var.set("RAM processing...")
+                    # === POST-PROCESSING ===
+                    # Get early PAR2 result from streaming verification if available
+                    early_par2_result = None
+                    if streaming_pp:
+                        # Wait briefly for early PAR2 to finish if it's running
+                        streaming_pp.wait_for_par2(timeout=5)
+                        early_par2_result = streaming_pp.get_early_result()
+                        if early_par2_result:
+                            verified, _, msg = early_par2_result
+                            logger.info(f"Early PAR2 result available: verified={verified}, {msg}")
+                            if not verified:
+                                self._log("PAR2: Repair needed", "warning")
 
-                            # Note: Don't add release_title here - process() adds it via release_name
-                            extract_dir = Path(self._config.postprocess.extract_dir)
-                            extract_dir.mkdir(parents=True, exist_ok=True)
+                    # Determine if we should skip extraction (streaming handled it)
+                    should_skip_extraction = (streaming_extracted_files > 0 and not remaining_archives)
 
-                            # Progress callback to update UI with actual stage
-                            def ram_progress_callback(stage: str, pct: float):
-                                logger.debug(f"[RAM] {stage}: {pct:.0f}%")
-                                # Update UI with current stage (truncate long messages)
-                                display_stage = stage[:40] + "..." if len(stage) > 40 else stage
-                                self._queue_info_var.set(f"RAM: {display_stage}")
+                    if should_skip_extraction:
+                        self._log("All archives extracted during download!", "success")
+                        logger.info("Streaming extraction handled all archives, skipping post-processing extraction")
 
-                            ram_pp = RamPostProcessor(
-                                ram_buffer=ram_buffer,
-                                extract_dir=extract_dir,
-                                gpu_device_id=self._config.ram_processing.gpu_device_id,
-                                verify_threads=self._config.ram_processing.verify_threads or 0,
-                                password=nzb_password,  # Pass NZB password for encrypted archives
-                                on_progress=ram_progress_callback
-                            )
-
-                            pp_start = time.time()
-                            success, message = ram_pp.process(release_name=release_title, extraction_plan=extraction_plan)
-                            pp_elapsed = time.time() - pp_start
-
-                            if success:
-                                self._log(f"RAM processing: {message} ({pp_elapsed:.1f}s)", "success")
-                                logger.info(f"[RAM MODE] Completed: {message} in {pp_elapsed:.1f}s")
-                                # Show completion summary popup (if enabled)
-                                if self._config and self._config.ui.show_completion_summary:
-                                    self._show_ram_completion_summary(
-                                        ram_pp=ram_pp,
-                                        download_size=self._state.downloaded_bytes,
-                                        download_duration=elapsed
-                                    )
-                            else:
-                                self._log(f"RAM processing failed: {message}", "error")
-                                logger.error(f"[RAM MODE] Failed: {message}")
-                                # Show error popup
-                                self._master.after(100, lambda msg=message: messagebox.showerror(
-                                    "RAM Processing Failed",
-                                    f"{msg}\n\nCheck logs for details."
-                                ))
-
-                            # Cleanup RAM buffer
-                            ram_buffer.clear()
-                            logger.info("[RAM MODE] Buffer cleared")
-
-                        except Exception as e:
-                            logger.error(f"[RAM MODE] Post-processing error: {e}")
-                            self._log(f"RAM processing error: {e}", "error")
-                            # Fallback: flush to disk and use regular post-processing
-                            logger.info("[RAM MODE] Falling back to disk-based processing...")
-                            if ram_buffer:
-                                ram_buffer.flush_to_disk(download_dir)
-                                ram_buffer.clear()
-                    else:
-                        # === STANDARD POST-PROCESSING ===
-                        # Get early PAR2 result from streaming verification if available
-                        early_par2_result = None
-                        if streaming_pp:
-                            # Wait briefly for early PAR2 to finish if it's running
-                            streaming_pp.wait_for_par2(timeout=5)
-                            early_par2_result = streaming_pp.get_early_result()
-                            if early_par2_result:
-                                verified, _, msg = early_par2_result
-                                logger.info(f"Early PAR2 result available: verified={verified}, {msg}")
-                                if not verified:
-                                    self._log("PAR2: Repair needed", "warning")
-
-                        # Determine if we should skip extraction (streaming handled it)
-                        should_skip_extraction = (streaming_extracted_files > 0 and not remaining_archives)
-
-                        if should_skip_extraction:
-                            self._log("All archives extracted during download!", "success")
-                            logger.info("Streaming extraction handled all archives, skipping post-processing extraction")
-
-                        self._log("Post-processing started...", "info")
-                        logger.info("Starting post-processing...")
-                        self._run_post_processing(
-                            nzb_path,
-                            early_par2_result=early_par2_result,
-                            download_size=self._state.downloaded_bytes,
-                            download_duration=elapsed,
-                            direct_to_destination=direct_to_destination,
-                            actual_download_dir=download_dir,
-                            skip_extraction=should_skip_extraction,
-                            streaming_extract_path=Path(self._config.postprocess.extract_dir) / release_title if should_skip_extraction else None
-                        )
+                    self._log("Post-processing started...", "info")
+                    logger.info("Starting post-processing...")
+                    self._run_post_processing(
+                        nzb_path,
+                        early_par2_result=early_par2_result,
+                        download_size=self._state.downloaded_bytes,
+                        download_duration=elapsed,
+                        direct_to_destination=direct_to_destination,
+                        actual_download_dir=download_dir,
+                        skip_extraction=should_skip_extraction,
+                        streaming_extract_path=Path(self._config.postprocess.extract_dir) / release_title if should_skip_extraction else None
+                    )
                     logger.info("Post-processing finished")
                 else:
                     logger.info("Post-processing disabled or no config")
@@ -1230,75 +1264,16 @@ class DLERApp:
                         logger.info(f"[INCOMPLETE] Downloaded {segments_ok}/{segments_total} segments ({success_rate:.1f}%)")
                         logger.info(f"[INCOMPLETE] {downloaded_bytes / (1024**2):.1f} MB downloaded, attempting repair...")
 
-                    # RAM MODE: Try GPU repair
-                    if use_ram_mode and ram_buffer and HAS_RAM_PROCESSOR:
-                        try:
-                            logger.info("[INCOMPLETE] Attempting GPU-accelerated PAR2 repair...")
-                            self._log("Attempting PAR2 repair (GPU)...", "warning")
-                            self._queue_info_var.set("PAR2 repair (GPU)...")
-
-                            extract_dir = Path(self._config.postprocess.extract_dir)
-                            extract_dir.mkdir(parents=True, exist_ok=True)
-
-                            def repair_progress_callback(stage: str, pct: float):
-                                logger.debug(f"[REPAIR] {stage}: {pct:.0f}%")
-                                display_stage = stage[:40] + "..." if len(stage) > 40 else stage
-                                self._queue_info_var.set(f"Repair: {display_stage}")
-
-                            ram_pp = RamPostProcessor(
-                                ram_buffer=ram_buffer,
-                                extract_dir=extract_dir,
-                                gpu_device_id=self._config.ram_processing.gpu_device_id,
-                                verify_threads=self._config.ram_processing.verify_threads or 0,
-                                password=nzb_password,
-                                on_progress=repair_progress_callback
-                            )
-
-                            pp_start = time.time()
-                            repair_success, repair_message = ram_pp.process(release_name=release_title, extraction_plan=extraction_plan)
-                            pp_elapsed = time.time() - pp_start
-
-                            if repair_success:
-                                self._log(f"PAR2 repair successful: {repair_message} ({pp_elapsed:.1f}s)", "success")
-                                logger.info(f"[INCOMPLETE] Repair successful: {repair_message}")
-                                self._queue_info_var.set("Repair successful!")
-                            else:
-                                self._log(f"PAR2 repair failed: {repair_message}", "error")
-                                logger.error(f"[INCOMPLETE] Repair failed: {repair_message}")
-                                self._queue_info_var.set("Repair failed")
-                                # Show warning
-                                self._master.after(100, lambda msg=repair_message: self._show_warning(
-                                    "Download Incomplete - Repair Failed",
-                                    f"Download was incomplete and PAR2 repair could not recover the files.\n\n"
-                                    f"Error: {msg}\n\n"
-                                    "Possible causes:\n"
-                                    "- Not enough PAR2 recovery blocks\n"
-                                    "- Too many missing segments\n"
-                                    "- DMCA takedown"
-                                ))
-
-                            # Cleanup RAM buffer
-                            ram_buffer.clear()
-                            logger.info("[INCOMPLETE] Buffer cleared")
-
-                        except Exception as e:
-                            logger.error(f"[INCOMPLETE] Repair error: {e}")
-                            self._log(f"Repair error: {e}", "error")
-                            self._master.after(100, lambda err=str(e): self._show_warning(
-                                "Repair Error",
-                                f"An error occurred during PAR2 repair:\n\n{err}"
-                            ))
-                    else:
-                        # Disk mode: try standard post-processing
-                        logger.info("[INCOMPLETE] Attempting disk-based PAR2 repair...")
-                        self._run_post_processing(
-                            nzb_path,
-                            early_par2_result=(False, False, "Download incomplete"),
-                            download_size=downloaded_bytes,
-                            download_duration=elapsed,
-                            direct_to_destination=direct_to_destination,
-                            actual_download_dir=download_dir
-                        )
+                    # Attempt disk-based PAR2 repair
+                    logger.info("[INCOMPLETE] Attempting disk-based PAR2 repair...")
+                    self._run_post_processing(
+                        nzb_path,
+                        early_par2_result=(False, False, "Download incomplete"),
+                        download_size=downloaded_bytes,
+                        download_duration=elapsed,
+                        direct_to_destination=direct_to_destination,
+                        actual_download_dir=download_dir
+                    )
                 else:
                     # Post-processing disabled - just show warning
                     self._master.after(100, lambda: self._show_warning(
@@ -1307,16 +1282,32 @@ class DLERApp:
                         "Enable post-processing to attempt PAR2 repair."
                     ))
 
+            # Automation: post-process script hook (fires once per download attempt).
+            try:
+                pp = self._last_pp_result
+                self._fire_post_script(self._build_script_context(
+                    release=release_title,
+                    nzb=nzb_path,
+                    output_dir=self._config.download.output_dir,
+                    extract_dir=(getattr(pp, "extract_path", "") if pp else ""),
+                    success=bool(success),
+                    repaired=(getattr(pp, "par2_repaired", False) if pp else False),
+                    files_extracted=(getattr(pp, "files_extracted", 0) if pp else 0),
+                    download_bytes=self._state.downloaded_bytes,
+                    duration_s=elapsed,
+                    segments_done=self._state.segments_done,
+                    segments_total=(self._state.segments_total or getattr(self._state, "nzb_segments_total", 0)),
+                    connections=self._config.server.connections,
+                    num_processes=(self._config.turbo.num_processes if self._config.turbo.use_multiprocess else 1),
+                ))
+            except Exception as e:
+                logger.warning(f"[POST-SCRIPT] hook error: {e}")
+
         except Exception as e:
             logger.error(f"Download error: {e}")
             self._queue_info_var.set(f"Error: {e}")
             self._log(f"Error: {e}", "error")
         finally:
-            # Reset RAM mode for next download
-            if self._turbo_engine:
-                self._turbo_engine.ram_buffer = None
-                self._turbo_engine.ram_mode = False
-
             self._state.is_downloading = False
             self._state.current_file = ""
             self._update_queue_info()
@@ -1438,6 +1429,13 @@ class DLERApp:
             logger.info(f"PostProcessor created. PAR2={processor.par2_path}, 7z={processor.sevenzip_path}")
             logger.info(f"Calling processor.process(direct_to_destination={direct_to_destination}, skip_extraction={skip_extraction})...")
 
+            # Expose the processor so STOP can cancel it (and don't even start if
+            # STOP was pressed between download and here).
+            self._active_processor = processor
+            if self._stop_requested:
+                logger.info("[STOP] Skipping post-processing (stop requested)")
+                return None
+
             # Pass early PAR2 result to skip re-verification if already done
             result = processor.process(
                 nzb_path,
@@ -1445,6 +1443,7 @@ class DLERApp:
                 direct_to_destination=direct_to_destination,
                 skip_extraction=skip_extraction
             )
+            self._last_pp_result = result
 
             # If streaming extraction handled files, update result path
             if skip_extraction and streaming_extract_path and streaming_extract_path.exists():
@@ -1528,14 +1527,25 @@ class DLERApp:
                 write_through=self._config.turbo.write_through,
                 on_progress=self._on_progress,
                 raw_queue_size=self._config.turbo.raw_queue_size,
-                write_queue_size=self._config.turbo.write_queue_size
+                write_queue_size=self._config.turbo.write_queue_size,
+                use_adaptive_pipeline=self._config.turbo.use_adaptive_pipeline,
+                min_connections=self._config.turbo.min_connections,
+                max_pipeline_depth=self._config.turbo.max_pipeline_depth,
             )
 
-            conn_count = self._turbo_engine.connect()
-            self._state.connections_active = conn_count
-            self._state.connections_total = conn_count  # Use actual connected count
-            self._queue_info_var.set(f"Connected: {conn_count} connections")
-            self._log(f"Connected to {self._config.server.host} ({conn_count} connections)", "success")
+            # In multiprocess mode the CHILD processes own the connections. The
+            # main engine must not pre-open any, or it consumes the provider's
+            # per-account connection budget and starves the children → the whole
+            # download stalls/freezes. So skip the main-engine connect in MP mode.
+            if getattr(self._config.turbo, "use_multiprocess", False):
+                self._queue_info_var.set("Multiprocess mode — starting workers...")
+                logger.info("[MP] Main engine left unconnected; child processes own the connection budget")
+            else:
+                conn_count = self._turbo_engine.connect()
+                self._state.connections_active = conn_count
+                self._state.connections_total = conn_count  # Use actual connected count
+                self._queue_info_var.set(f"Connected: {conn_count} connections")
+                self._log(f"Connected to {self._config.server.host} ({conn_count} connections)", "success")
 
         except Exception as e:
             logger.error(f"Init failed: {e}")
@@ -1577,15 +1587,24 @@ class DLERApp:
         if hasattr(self, '_is_paused') and self._is_paused:
             return
 
-        if hasattr(self, '_turbo_engine') and self._turbo_engine:
-            self._state.speed_mbps = self._turbo_engine._speed_tracker.speed_mbps
-            self._state.queue_raw = self._turbo_engine._raw_queue.qsize()
-            self._state.queue_write = self._turbo_engine._write_queue.qsize()
-            # Get active connections from engine
+        # Smooth the displayed download speed from CUMULATIVE bytes. This works
+        # in both single-process and multiprocess modes (in MP the main engine's
+        # own _speed_tracker is idle), and a longer window + low EMA alpha damps
+        # the per-segment/per-poll jitter so the graph stops swinging.
+        tracker = getattr(self, '_gui_speed', None)
+        if tracker is None:
+            from ..core.turbo_engine_v2 import SpeedTracker
+            tracker = self._gui_speed = SpeedTracker(window_seconds=8.0, alpha=0.10)
+        tracker.update(int(getattr(stats, 'bytes_downloaded', 0)))
+        self._state.speed_mbps = tracker.speed_mbps
+
+        if getattr(self, '_turbo_engine', None):
             try:
+                self._state.queue_raw = self._turbo_engine._raw_queue.qsize()
+                self._state.queue_write = self._turbo_engine._write_queue.qsize()
                 self._state.connections_active = len([c for c in self._turbo_engine._connections if c and c.socket])
-            except:
-                pass  # Keep previous value if error
+            except Exception:
+                pass  # stale in MP mode / between downloads — keep previous values
 
         self._state.downloaded_bytes = stats.bytes_written
         self._state.segments_done = stats.segments_written
@@ -1634,14 +1653,39 @@ class DLERApp:
             self._queue_info_var.set("Paused")
 
     def _stop_download(self) -> None:
-        """Stop download."""
+        """Stop download — abort EVERY stage (download, MP child procs, post-processing)."""
+        self._stop_requested = True
+
+        # 1. Multiprocess download: terminate the child processes.
+        if self._mp_stop_event is not None:
+            try:
+                self._mp_stop_event.set()
+            except Exception:
+                pass
+
+        # 2. Single-process engine.
         if self._turbo_engine:
             if hasattr(self._turbo_engine, 'stop'):
-                self._turbo_engine.stop()
-            # Disconnect and reset engine
+                try: self._turbo_engine.stop()
+                except Exception: pass
             if hasattr(self._turbo_engine, 'disconnect'):
-                self._turbo_engine.disconnect()
+                try: self._turbo_engine.disconnect()
+                except Exception: pass
             self._turbo_engine = None
+
+        # 3. Post-processing: ask it to stop, AND hard-kill any in-flight tool
+        #    subprocess — a blocking subprocess.run (par2/7z/unrar) won't honour
+        #    the flag mid-call, so terminate the external process directly.
+        if self._active_processor is not None and hasattr(self._active_processor, 'stop'):
+            try: self._active_processor.stop()
+            except Exception: pass
+        import subprocess
+        for _tool in ('par2j64.exe', '7z.exe', '7zr.exe', 'UnRAR.exe'):
+            try:
+                subprocess.run(['taskkill', '/F', '/IM', _tool],
+                               capture_output=True, creationflags=0x08000000)
+            except Exception:
+                pass
 
         # Reset state
         self._state.is_downloading = False
@@ -1766,259 +1810,58 @@ class DLERApp:
 
         message = "\n".join(lines)
 
-        self._master.after(100, lambda: messagebox.showinfo(title, message))
+        self._master.after(100, lambda: self._show_themed_summary(title, message))
 
-    def _show_ram_completion_summary(
-        self,
-        ram_pp,
-        download_size: int,
-        download_duration: float
-    ) -> None:
-        """Show beautiful completion dialog for RAM mode processing."""
-        self._master.after(100, lambda: self._create_completion_dialog(
-            ram_pp, download_size, download_duration
-        ))
+    def _show_themed_summary(self, title: str, message: str) -> None:
+        """Dark-themed final summary dialog (disk/MP mode).
 
-    def _create_completion_dialog(
-        self,
-        ram_pp,
-        download_size: int,
-        download_duration: float
-    ) -> None:
-        """Create themed completion dialog showcasing RAM mode performance."""
-        # Theme colors (matching park dark theme)
+        Replaces tkinter.messagebox.showinfo, which is a NATIVE Windows dialog
+        that is always light and cannot be themed — so the non-RAM completion
+        summary used to clash with the park-dark interface. This Toplevel matches
+        the rest of the app.
+        """
         BG_DARK = "#1e1e1e"
-        BG_PANEL = "#2b2b2b"
-        BG_ACCENT = "#333333"
+        BG_PANEL = "#262626"
         FG_TEXT = "#e0e0e0"
-        FG_DIM = "#808080"
-        FG_ACCENT = "#2d9254"  # Green accent
-        FG_GOLD = "#d4a62a"    # Gold for highlights
-        FG_CYAN = "#4fc3f7"    # Cyan for speed
+        FG_ACCENT = "#2d9254"   # green accent (matches the app)
 
-        # Fonts
-        FONT_HEADER = ("Segoe UI", 16, "bold")
-        FONT_BIG = ("Consolas", 32, "bold")
-        FONT_MEDIUM = ("Consolas", 18, "bold")
-        FONT_LABEL = ("Segoe UI", 10)
-        FONT_VALUE = ("Consolas", 11, "bold")
-        FONT_SMALL = ("Segoe UI", 9)
-
-        # Create dialog
         dialog = tk.Toplevel(self._master)
-        dialog.title("RAM Mode Complete")
+        dialog.title(title)
         dialog.configure(bg=BG_DARK)
         dialog.resizable(False, False)
         dialog.transient(self._master)
-        dialog.grab_set()
+        try:
+            if self._icon_image:
+                dialog.iconphoto(False, self._icon_image)
+        except Exception:
+            pass
 
-        # Set initial size and allow auto-sizing
-        dialog.geometry("480x620")
-        dialog.update_idletasks()
-
-        # Center on parent
-        x = self._master.winfo_x() + (self._master.winfo_width() - 480) // 2
-        y = self._master.winfo_y() + (self._master.winfo_height() - 620) // 2
-        dialog.geometry(f"+{x}+{y}")
-
-        # Main container
-        main = tk.Frame(dialog, bg=BG_DARK, padx=20, pady=15)
+        main = tk.Frame(dialog, bg=BG_DARK, padx=24, pady=18)
         main.pack(fill="both", expand=True)
 
-        # === HEADER ===
-        header = tk.Frame(main, bg=BG_DARK)
-        header.pack(fill="x", pady=(0, 15))
+        tk.Label(main, text=title, font=("Segoe UI", 15, "bold"),
+                 fg=FG_ACCENT, bg=BG_DARK, anchor="w").pack(fill="x")
 
-        tk.Label(
-            header, text="RAM MODE", font=FONT_HEADER,
-            fg=FG_ACCENT, bg=BG_DARK
-        ).pack(side="left")
+        body = tk.Frame(main, bg=BG_PANEL, padx=16, pady=12)
+        body.pack(fill="both", expand=True, pady=(12, 14))
+        tk.Label(body, text=message, font=("Consolas", 10), justify="left",
+                 fg=FG_TEXT, bg=BG_PANEL, anchor="w").pack(anchor="w")
 
-        tk.Label(
-            header, text="COMPLETE", font=FONT_HEADER,
-            fg=FG_TEXT, bg=BG_DARK
-        ).pack(side="left", padx=(8, 0))
+        close = tk.Button(main, text="Close", font=("Segoe UI", 10, "bold"),
+                          fg=FG_TEXT, bg=BG_PANEL, activebackground=FG_ACCENT,
+                          activeforeground="#ffffff", relief="flat", padx=22, pady=6,
+                          cursor="hand2", command=dialog.destroy)
+        close.pack(anchor="e")
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
+        dialog.bind("<Return>", lambda _e: dialog.destroy())
 
-        # === SPEED SHOWCASE (Big numbers) ===
-        speed_frame = tk.Frame(main, bg=BG_PANEL, padx=15, pady=12)
-        speed_frame.pack(fill="x", pady=(0, 12))
-
-        # Download speed
-        dl_speed = download_size / (download_duration * 1024 * 1024) if download_duration > 0 else 0
-
-        speed_row = tk.Frame(speed_frame, bg=BG_PANEL)
-        speed_row.pack(fill="x")
-
-        # Network speed (left)
-        net_box = tk.Frame(speed_row, bg=BG_ACCENT, padx=12, pady=8)
-        net_box.pack(side="left", fill="both", expand=True, padx=(0, 6))
-
-        tk.Label(
-            net_box, text="NETWORK", font=FONT_SMALL,
-            fg=FG_DIM, bg=BG_ACCENT
-        ).pack(anchor="w")
-
-        net_val_frame = tk.Frame(net_box, bg=BG_ACCENT)
-        net_val_frame.pack(anchor="w")
-        tk.Label(
-            net_val_frame, text=f"{dl_speed:.0f}", font=FONT_BIG,
-            fg=FG_CYAN, bg=BG_ACCENT
-        ).pack(side="left")
-        tk.Label(
-            net_val_frame, text=" MB/s", font=FONT_LABEL,
-            fg=FG_DIM, bg=BG_ACCENT
-        ).pack(side="left", anchor="s", pady=(0, 8))
-
-        # RAM→Disk speed (right)
-        ram_box = tk.Frame(speed_row, bg=BG_ACCENT, padx=12, pady=8)
-        ram_box.pack(side="left", fill="both", expand=True, padx=(6, 0))
-
-        tk.Label(
-            ram_box, text="RAM\u2192DISK", font=FONT_SMALL,
-            fg=FG_DIM, bg=BG_ACCENT
-        ).pack(anchor="w")
-
-        ram_val_frame = tk.Frame(ram_box, bg=BG_ACCENT)
-        ram_val_frame.pack(anchor="w")
-
-        # Calculate RAM→Disk speed based on ACTUAL disk writes
-        # This includes both extraction (direct to disk) and flush phases
-        total_disk_duration = ram_pp.stats_extract_duration + ram_pp.stats_flush_duration
-        total_disk_bytes = ram_pp.stats_flush_bytes
-
-        # For extraction with archives, use extracted size; for direct media, use flush size
-        if ram_pp.stats_files_extracted > 0 and ram_pp.stats_extract_duration > 0.1:
-            # Archives were extracted - use processing duration with download size
-            # (extraction writes decompressed data directly to disk)
-            ram_speed = download_size / (1024 * 1024) / total_disk_duration if total_disk_duration > 0 else 0
-        elif ram_pp.stats_flush_duration > 0 and total_disk_bytes > 0:
-            # No extraction (DIRECT_MEDIA) - use flush stats
-            ram_speed = ram_pp.stats_flush_speed_mbs
-        else:
-            ram_speed = 0
-
-        tk.Label(
-            ram_val_frame, text=f"{ram_speed:.0f}", font=FONT_BIG,
-            fg=FG_GOLD, bg=BG_ACCENT
-        ).pack(side="left")
-        tk.Label(
-            ram_val_frame, text=" MB/s", font=FONT_LABEL,
-            fg=FG_DIM, bg=BG_ACCENT
-        ).pack(side="left", anchor="s", pady=(0, 8))
-
-        # === RESULTS PANEL ===
-        results = tk.Frame(main, bg=BG_PANEL, padx=15, pady=12)
-        results.pack(fill="x", pady=(0, 12))
-
-        def add_result_row(parent, label: str, value: str, highlight: bool = False):
-            row = tk.Frame(parent, bg=BG_PANEL)
-            row.pack(fill="x", pady=2)
-            tk.Label(
-                row, text=label, font=FONT_LABEL,
-                fg=FG_DIM, bg=BG_PANEL, width=18, anchor="w"
-            ).pack(side="left")
-            tk.Label(
-                row, text=value, font=FONT_VALUE,
-                fg=FG_ACCENT if highlight else FG_TEXT, bg=BG_PANEL
-            ).pack(side="left")
-
-        # Files extracted (THE MAIN RESULT!)
-        extracted = ram_pp.stats_files_extracted
-        if extracted > 0:
-            add_result_row(results, "Files extracted:", f"{extracted:,}", highlight=True)
-
-        # Download size
-        if download_size > 0:
-            size_str = f"{download_size / (1024**3):.2f} GB" if download_size >= 1024**3 else f"{download_size / (1024**2):.1f} MB"
-            add_result_row(results, "Downloaded:", size_str)
-
-        # Verification
-        verified = ram_pp.stats_files_verified
-        if verified > 0:
-            verify_status = f"{verified} files OK"
-            if ram_pp.stats_files_damaged > 0:
-                verify_status += f" ({ram_pp.stats_files_repaired} repaired)"
-            add_result_row(results, "Verification:", verify_status)
-
-        # === TIMING PANEL ===
-        timing = tk.Frame(main, bg=BG_PANEL, padx=15, pady=12)
-        timing.pack(fill="x", pady=(0, 12))
-
-        def format_time(seconds: float) -> str:
-            if seconds >= 3600:
-                h, m = divmod(int(seconds), 3600)
-                m, s = divmod(m, 60)
-                return f"{h}h {m}m {s}s"
-            elif seconds >= 60:
-                m, s = divmod(int(seconds), 60)
-                return f"{m}m {s}s"
-            return f"{seconds:.1f}s"
-
-        def add_timing_row(parent, label: str, value: str, bold: bool = False):
-            row = tk.Frame(parent, bg=BG_PANEL)
-            row.pack(fill="x", pady=2)
-            tk.Label(
-                row, text=label, font=FONT_LABEL,
-                fg=FG_DIM, bg=BG_PANEL, width=18, anchor="w"
-            ).pack(side="left")
-            tk.Label(
-                row, text=value,
-                font=("Consolas", 11, "bold") if bold else FONT_VALUE,
-                fg=FG_GOLD if bold else FG_TEXT, bg=BG_PANEL
-            ).pack(side="left")
-
-        add_timing_row(timing, "Download time:", format_time(download_duration))
-        if ram_pp.stats_total_duration > 0:
-            add_timing_row(timing, "Processing time:", format_time(ram_pp.stats_total_duration))
-
-        # Separator
-        sep = tk.Frame(timing, bg=BG_ACCENT, height=1)
-        sep.pack(fill="x", pady=8)
-
-        # TOTAL TIME (highlighted)
-        total_time = download_duration + ram_pp.stats_total_duration
-        add_timing_row(timing, "TOTAL TIME:", format_time(total_time), bold=True)
-
-        # === DESTINATION ===
-        if ram_pp.stats_extract_path:
-            dest_frame = tk.Frame(main, bg=BG_DARK)
-            dest_frame.pack(fill="x", pady=(0, 15))
-
-            tk.Label(
-                dest_frame, text="Destination:", font=FONT_SMALL,
-                fg=FG_DIM, bg=BG_DARK
-            ).pack(anchor="w")
-
-            # Truncate path if too long
-            path_str = str(ram_pp.stats_extract_path)
-            if len(path_str) > 55:
-                path_str = "..." + path_str[-52:]
-
-            tk.Label(
-                dest_frame, text=path_str, font=("Consolas", 9),
-                fg=FG_TEXT, bg=BG_DARK
-            ).pack(anchor="w")
-
-        # === OK BUTTON ===
-        btn_frame = tk.Frame(main, bg=BG_DARK)
-        btn_frame.pack(fill="x", pady=(10, 5))
-
-        ok_btn = tk.Button(
-            btn_frame, text="  OK  ", font=("Segoe UI", 11, "bold"),
-            padx=30, pady=8,
-            bg=FG_ACCENT, fg="white",
-            activebackground="#3daf6a", activeforeground="white",
-            relief="raised", bd=2, cursor="hand2",
-            command=dialog.destroy
-        )
-        ok_btn.pack()
-
-        # Bind Enter key to close
-        dialog.bind("<Return>", lambda e: dialog.destroy())
-        dialog.bind("<Escape>", lambda e: dialog.destroy())
-
-        # Focus dialog
-        dialog.focus_set()
+        # Center over the main window.
+        dialog.update_idletasks()
+        x = self._master.winfo_rootx() + (self._master.winfo_width() - dialog.winfo_width()) // 2
+        y = self._master.winfo_rooty() + 90
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dialog.lift()
+        dialog.focus_force()
 
     def _force_100_percent(self) -> None:
         """Force progress to 100% on main thread."""
@@ -2158,6 +2001,7 @@ class DLERApp:
     def _quit_app(self) -> None:
         """Quit application completely."""
         logger.info("Application shutting down...")
+        self._stop_watch_folder()
 
         # Stop system tray
         if self._system_tray:
@@ -2243,10 +2087,10 @@ class SettingsDialog:
         notebook.add(pp_frame, text="Post-Process")
         self._create_postprocess_tab(pp_frame)
 
-        # RAM/GPU tab
-        ram_frame = ttk.Frame(notebook, padding=20)
-        notebook.add(ram_frame, text="RAM/GPU")
-        self._create_ram_gpu_tab(ram_frame)
+        # Automation tab (watchfolder + post-process script)
+        automation_frame = ttk.Frame(notebook, padding=20)
+        notebook.add(automation_frame, text="Automation")
+        self._create_automation_tab(automation_frame)
 
         # System tab (tray, auto-start)
         system_frame = ttk.Frame(notebook, padding=20)
@@ -2465,120 +2309,85 @@ class SettingsDialog:
             parent, text="Delete archives after extraction", variable=self._cleanup_var
         ).grid(row=row, column=0, columnspan=2, sticky="w", padx=(20, 0), pady=2)
 
-    def _create_ram_gpu_tab(self, parent) -> None:
-        """RAM/GPU processing settings."""
+    def _create_automation_tab(self, parent) -> None:
+        """Watchfolder + post-process script settings."""
+        import tkinter as tk
+        from tkinter import filedialog, ttk
         parent.columnconfigure(1, weight=1)
-
+        wf = self._config.watchfolder if self._config else None
+        ps = self._config.post_script if self._config else None
         row = 0
-        # Header info
-        info = ttk.Label(
-            parent,
-            text="Process downloads in RAM for maximum speed.\nRequires sufficient RAM (recommended: 32+ GB).",
-            font=FONT_LABEL
-        )
-        info.grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(parent, text="Watchfolder", font=("Segoe UI", 11, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 6)); row += 1
+
+        self._wf_enabled_var = tk.BooleanVar(value=wf.enabled if wf else False)
+        ttk.Checkbutton(parent, text="Auto-ingest .nzb files dropped in a folder",
+                        variable=self._wf_enabled_var).grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=(20, 0), pady=2); row += 1
+
+        ttk.Label(parent, text="Folder:").grid(row=row, column=0, sticky="w", padx=(20, 0), pady=6)
+        self._wf_folder_var = tk.StringVar(value=wf.folder if wf else "")
+        folder_frame = ttk.Frame(parent); folder_frame.grid(row=row, column=1, sticky="ew", pady=6)
+        ttk.Entry(folder_frame, textvariable=self._wf_folder_var).pack(side="left", fill="x", expand=True)
+        ttk.Button(folder_frame, text="Browse...",
+                   command=lambda: self._wf_folder_var.set(
+                       filedialog.askdirectory() or self._wf_folder_var.get())).pack(side="left", padx=(6, 0))
         row += 1
 
-        # Enable RAM processing
-        self._ram_enabled_var = tk.BooleanVar(
-            value=self._config.ram_processing.enabled if self._config else False
-        )
-        ttk.Checkbutton(
-            parent,
-            text="Enable RAM-based processing",
-            variable=self._ram_enabled_var
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=6)
-        row += 1
+        ttk.Label(parent, text="Check folder every:").grid(row=row, column=0, sticky="w", padx=(20, 0), pady=6)
+        self._wf_interval_var = tk.IntVar(value=wf.poll_interval_s if wf else 5)
+        iv = ttk.Frame(parent); iv.grid(row=row, column=1, sticky="w", pady=6)
+        ttk.Spinbox(iv, textvariable=self._wf_interval_var, from_=1, to=3600, width=8).pack(side="left")
+        ttk.Label(iv, text="seconds (surveillance timer)").pack(side="left", padx=(10, 0)); row += 1
 
-        ttk.Separator(parent, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
-        row += 1
+        self._wf_autostart_var = tk.BooleanVar(value=wf.auto_start if wf else True)
+        ttk.Checkbutton(parent, text="Start download immediately (else just queue)",
+                        variable=self._wf_autostart_var).grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=(20, 0), pady=2); row += 1
 
-        # Max RAM size
-        ttk.Label(parent, text="Max RAM Size:", font=FONT_LABEL).grid(row=row, column=0, sticky="w", pady=6)
-        self._ram_size_var = tk.IntVar(
-            value=self._config.ram_processing.max_size_mb // 1024 if self._config else 32
-        )
-        ram_frame = ttk.Frame(parent)
-        ram_frame.grid(row=row, column=1, sticky="w", pady=6)
-        ttk.Spinbox(ram_frame, textvariable=self._ram_size_var, from_=1, to=128, width=8, font=FONT_VALUE_SMALL).pack(side="left")
-        ttk.Label(ram_frame, text="GB (for processing)", font=FONT_LABEL).pack(side="left", padx=(10, 0))
-        row += 1
+        ttk.Separator(parent, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=12); row += 1
+        ttk.Label(parent, text="Post-process script", font=("Segoe UI", 11, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 6)); row += 1
 
-        # Flush buffer
-        ttk.Label(parent, text="Flush Buffer:", font=FONT_LABEL).grid(row=row, column=0, sticky="w", pady=6)
-        self._flush_buffer_var = tk.IntVar(
-            value=self._config.ram_processing.flush_buffer_mb if self._config else 256
-        )
-        flush_frame = ttk.Frame(parent)
-        flush_frame.grid(row=row, column=1, sticky="w", pady=6)
-        ttk.Spinbox(flush_frame, textvariable=self._flush_buffer_var, from_=64, to=4096, width=8, font=FONT_VALUE_SMALL).pack(side="left")
-        ttk.Label(flush_frame, text="MB (disk write buffer)", font=FONT_LABEL).pack(side="left", padx=(10, 0))
-        row += 1
+        self._ps_enabled_var = tk.BooleanVar(value=ps.enabled if ps else False)
+        ttk.Checkbutton(parent, text="Run a command after each download",
+                        variable=self._ps_enabled_var).grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=(20, 0), pady=2); row += 1
 
-        ttk.Separator(parent, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
-        row += 1
+        ttk.Label(parent, text="Command:").grid(row=row, column=0, sticky="w", padx=(20, 0), pady=6)
+        self._ps_command_var = tk.StringVar(value=ps.command if ps else "")
+        ttk.Entry(parent, textvariable=self._ps_command_var).grid(row=row, column=1, sticky="ew", pady=6); row += 1
 
-        # GPU Section
-        # Use IS_ULTIMATE_EDITION for label, HAS_CUDA for functionality
-        if not IS_ULTIMATE_EDITION:
-            gpu_section_text = "GPU Acceleration: (Basic Edition - not available)"
-        elif HAS_CUDA:
-            gpu_section_text = "GPU Acceleration:"
-        else:
-            gpu_section_text = "GPU Acceleration: (CUDA not detected)"
-        ttk.Label(parent, text=gpu_section_text, font=FONT_SECTION).grid(
-            row=row, column=0, columnspan=2, sticky="w", pady=(6, 4)
-        )
-        row += 1
+        ttk.Label(parent, text="Timeout:").grid(row=row, column=0, sticky="w", padx=(20, 0), pady=6)
+        self._ps_timeout_var = tk.IntVar(value=ps.timeout_s if ps else 300)
+        tv = ttk.Frame(parent); tv.grid(row=row, column=1, sticky="w", pady=6)
+        ttk.Spinbox(tv, textvariable=self._ps_timeout_var, from_=1, to=86400, width=8).pack(side="left")
+        ttk.Label(tv, text="seconds").pack(side="left", padx=(10, 0)); row += 1
 
-        # Show CUDA error if any (for debugging)
-        if IS_ULTIMATE_EDITION and not HAS_CUDA and _cuda_error:
-            error_label = ttk.Label(parent, text=f"Error: {_cuda_error}", font=FONT_LABEL, foreground="red")
-            error_label.grid(row=row, column=0, columnspan=2, sticky="w", padx=(20, 0), pady=2)
-            row += 1
+        ttk.Label(parent, text="Env vars: DLER_RELEASE, DLER_NZB, DLER_OUTPUT_DIR, DLER_EXTRACT_DIR,\n"
+                              "DLER_SUCCESS, DLER_REPAIRED, DLER_FILES_EXTRACTED, DLER_DOWNLOAD_BYTES",
+                  font=("Segoe UI", 8), foreground="#808080", justify="left").grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=(20, 0), pady=(8, 0))
 
-        # GPU repair - disabled if Basic edition OR no CUDA
-        gpu_enabled = IS_ULTIMATE_EDITION and HAS_CUDA
-        self._gpu_repair_var = tk.BooleanVar(
-            value=(self._config.ram_processing.gpu_repair if self._config else True) if gpu_enabled else False
-        )
-        gpu_repair_cb = ttk.Checkbutton(
-            parent,
-            text="Use GPU for Reed-Solomon repair (CUDA)",
-            variable=self._gpu_repair_var
-        )
-        gpu_repair_cb.grid(row=row, column=0, columnspan=2, sticky="w", padx=(20, 0), pady=2)
-        if not gpu_enabled:
-            gpu_repair_cb.configure(state="disabled")
-        row += 1
-
-        # GPU device
-        gpu_device_label = ttk.Label(parent, text="GPU Device ID:", font=FONT_LABEL)
-        gpu_device_label.grid(row=row, column=0, sticky="w", padx=(20, 0), pady=6)
-        self._gpu_device_var = tk.IntVar(
-            value=self._config.ram_processing.gpu_device_id if self._config else 0
-        )
-        gpu_frame = ttk.Frame(parent)
-        gpu_frame.grid(row=row, column=1, sticky="w", pady=6)
-        gpu_spinbox = ttk.Spinbox(gpu_frame, textvariable=self._gpu_device_var, from_=0, to=7, width=8, font=FONT_VALUE_SMALL)
-        gpu_spinbox.pack(side="left")
-        ttk.Label(gpu_frame, text="(0 = first GPU)", font=FONT_LABEL).pack(side="left", padx=(10, 0))
-        if not gpu_enabled:
-            gpu_spinbox.configure(state="disabled")
-        row += 1
-
-        ttk.Separator(parent, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=10)
-        row += 1
-
-        # Verify threads
-        ttk.Label(parent, text="Verify Threads:", font=FONT_LABEL).grid(row=row, column=0, sticky="w", pady=6)
-        self._verify_threads_var = tk.IntVar(
-            value=self._config.ram_processing.verify_threads if self._config else 0
-        )
-        verify_frame = ttk.Frame(parent)
-        verify_frame.grid(row=row, column=1, sticky="w", pady=6)
-        ttk.Spinbox(verify_frame, textvariable=self._verify_threads_var, from_=0, to=32, width=8, font=FONT_VALUE_SMALL).pack(side="left")
-        ttk.Label(verify_frame, text="(0 = auto, for MD5)", font=FONT_LABEL).pack(side="left", padx=(10, 0))
+    def _save_automation_settings(self) -> None:
+        self._config.watchfolder.enabled = self._wf_enabled_var.get()
+        self._config.watchfolder.folder = self._wf_folder_var.get()
+        # Spinboxes accept manually-typed text; clamp to the valid ranges and
+        # tolerate garbage so a bad entry can never persist or raise on save.
+        try:
+            interval = int(self._wf_interval_var.get())
+        except (ValueError, tk.TclError):
+            interval = 5
+        self._config.watchfolder.poll_interval_s = max(1, min(3600, interval))
+        self._config.watchfolder.auto_start = self._wf_autostart_var.get()
+        self._config.post_script.enabled = self._ps_enabled_var.get()
+        self._config.post_script.command = self._ps_command_var.get()
+        try:
+            timeout = int(self._ps_timeout_var.get())
+        except (ValueError, tk.TclError):
+            timeout = 300
+        self._config.post_script.timeout_s = max(1, timeout)
 
     def _create_system_tab(self, parent) -> None:
         """System settings (tray, auto-start)."""
@@ -2706,13 +2515,8 @@ class SettingsDialog:
         self._config.postprocess.auto_extract = self._auto_extract_var.get()
         self._config.postprocess.cleanup_after_extract = self._cleanup_var.get()
 
-        # RAM/GPU processing settings
-        self._config.ram_processing.enabled = self._ram_enabled_var.get()
-        self._config.ram_processing.max_size_mb = self._ram_size_var.get() * 1024  # GB to MB
-        self._config.ram_processing.gpu_repair = self._gpu_repair_var.get()
-        self._config.ram_processing.gpu_device_id = self._gpu_device_var.get()
-        self._config.ram_processing.verify_threads = self._verify_threads_var.get()
-        self._config.ram_processing.flush_buffer_mb = self._flush_buffer_var.get()
+        # Automation settings (watchfolder + post-process script)
+        self._save_automation_settings()
 
         # System settings (tray, auto-start, notifications)
         self._config.ui.minimize_to_tray = self._minimize_to_tray_var.get()

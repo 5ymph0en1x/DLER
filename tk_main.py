@@ -102,4 +102,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # CRITICAL for frozen (PyInstaller) builds that use multiprocessing with the
+    # 'spawn' start method: each child re-launches this exe, and freeze_support()
+    # makes it run the worker function instead of re-starting the whole GUI.
+    import multiprocessing
+    multiprocessing.freeze_support()
     sys.exit(main())

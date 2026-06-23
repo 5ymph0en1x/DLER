@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dler"
-version = "1.2.1"
+version = "2.0.0"
 description = "High-performance NZB downloader with elegant TUI for Windows"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -34,6 +34,10 @@ dependencies = [
     "PySide6>=6.6.0",
     "qasync>=0.27.0",
     "pyqtgraph>=0.13.0",
+    # TKinter GUI (tk_main.py) runtime — required for the dark theme, drag-and-drop, logo
+    "TKinterModernThemes>=1.10.0",
+    "tkinterdnd2>=0.4.2",
+    "Pillow>=10.0.0",
 ]
 
 [project.optional-dependencies]

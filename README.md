@@ -4,7 +4,7 @@
 
 # DLER - Ultra-Fast Usenet Downloader
 
-High-performance NZB downloader engineered for **maximum throughput** on modern hardware. Built for users who want simplicity without sacrificing speed.
+High-performance NZB downloader engineered for **maximum throughput** on modern hardware and fast fiber. Built for users who want simplicity without sacrificing speed.
 
 <div align="center">
     <img src="screenshots/gui3.jpg" alt="DLER Screenshot">
@@ -12,154 +12,119 @@ High-performance NZB downloader engineered for **maximum throughput** on modern 
 
 ## Why DLER?
 
-**Different tools for different users.** While SABnzbd and NZBget excel at automation pipelines, DLER targets users who want **click-and-go simplicity**:
+**Different tools for different users.** While SABnzbd and NZBget excel at heavyweight automation pipelines, DLER targets users who want **click-and-go simplicity** that still saturates a 10 Gbps line:
 
-- Drag & drop an NZB
-- Watch your file download at wire speed
+- Drag & drop an NZB (or drop it in a watched folder)
+- Watch it download at wire speed across multiple processes
 - Done. No configuration rabbit holes.
 
 ## Features
 
 ### Core Engine
-- **Pipelined NNTP architecture** - Up to 50+ simultaneous connections with intelligent load balancing
-- **AVX2-accelerated yEnc decoding** - Native C++ SIMD decoder achieving **3+ GB/s** throughput
-- **Zero-copy I/O pipeline** - Download → Decode → Write with minimal memory copies
-- **Streaming PAR2 verification** - Verifies files *during* download, not after
-
-### RAM Mode
-- **Full in-memory pipeline** - Download, decode, and buffer entirely in RAM
-- **GPU-accelerated repair** - Optional CUDA/CuPy support for PAR2 operations
-- **Delayed disk I/O** - Only write extracted content to disk, skip intermediate files
-- **Ideal for large RAM systems** - 32+ GB RAM recommended for releases up to 30 GB
+- **Multiprocess download engine** - Escapes the CPython GIL by sharding an NZB's files across worker processes. Single-process tops out at ~625 MB/s (~5 Gbps); **2-3 processes reach ~970 MB/s (~7.8 Gbps)** on a 100-connection account.
+- **Pipelined NNTP architecture** - Up to 100 simultaneous connections with throughput-adaptive pipeline depth (AIMD) and a dynamic connection pool.
+- **AVX2-accelerated yEnc decoding** - Native C++ SIMD decoder achieving **3+ GB/s**, with a NumPy Python fallback when AVX2 is unavailable.
+- **Streaming PAR2 verification** - Verifies files *during* download, not after.
 
 ### Post-Processing
-- **Smart archive detection** - Analyzes NZB before download to optimize workflow
-- **Direct-to-destination** - Non-archive releases download directly to final location
-- **Automatic PAR2 repair** - Integrated par2j64 for data integrity
-- **Nested archive handling** - Extracts complex structures (ZIP containing RAR parts)
-- **Windows long path support** - Handles paths exceeding 260 characters
+- **Smart archive detection** - Analyzes the NZB before download to pick the optimal workflow.
+- **Direct-to-destination** - Non-archive releases download straight to their final location.
+- **Automatic PAR2 repair** - Integrated `par2j64` for data integrity.
+- **RAR / 7z / nested archives** - Extracts complex structures (ZIP containing RAR parts) via bundled `UnRAR64` and `7z`.
+- **Windows long-path support** - Handles paths exceeding 260 characters.
+
+### Automation
+- **Watch folder** - Drop a `.nzb` into a watched directory and DLER auto-ingests and downloads it. Configurable surveillance interval (1-3600 s), with a stability check so partially-copied files are never picked up early.
+- **Post-process script hook** - Run any command after each download. DLER exposes the full result through `DLER_*` environment variables (release, success, repaired, sizes, duration, average speed, segments, connections, processes...).
+- **Telegram completion card** - Ships with `dler_telegram.ps1`: a designed dark stat-card (release, size, average speed, duration, files, connections, processes, Gbps) rendered to PNG and sent to your Telegram. No dependencies to install (uses Edge headless + curl, both bundled with Windows 11).
 
 ### User Experience
-- **Real-time speed graph** - Visualize your entire download history with a smooth, anti-aliased curve
-- **Live activity logs** - Color-coded feedback (connection, progress, errors)
-- **Smooth progress animation** - Fluid progress bar with easing, not jerky percentage jumps
-- **Modern dark theme** - Clean Tkinter interface optimized for extended use
+- **Responsive STOP** - A single STOP aborts *every* stage: multiprocess child downloads, the single-process engine, and in-flight post-processing (PAR2 / extraction). No "it keeps going after I hit stop."
+- **Real-time speed graph** - Smooth, anti-aliased view of your entire download history.
+- **Live activity logs** - Color-coded feedback (connection, progress, errors).
+- **Smooth progress animation** - Eased progress bar, not jerky percentage jumps.
+- **Modern dark theme** - Clean Tkinter interface (TKinterModernThemes) optimized for extended use.
 
 ## Technical Architecture
 
-### Standard Mode (Disk-Based)
+### Multiprocess Pipeline (GIL escape)
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        DLER Architecture                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐   │
-│  │  NNTP    │───>│  Decode  │───>│  Write   │───>│  Verify  │   │
-│  │ Threads  │    │ Threads  │    │ Threads  │    │ (PAR2)   │   │
-│  │  (50+)   │    │ (CPU//2) │    │   (8)    │    │          │   │
-│  └──────────┘    └──────────┘    └──────────┘    └──────────┘   │
-│       │               │               │               │         │
-│       ▼               ▼               ▼               ▼         │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │              Lock-Free Ring Buffers                     │    │
-│  │         (Download Queue → Decode Queue → Write Queue)   │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│                       DLER Multiprocess Engine                      │
+├───────────────────────────────────────────────────────────────────┤
+│   NZB files are bin-packed by size into N shards (N = 2-3).         │
+│   The 100-connection account budget is split across the children.   │
+│                                                                     │
+│   ┌─ Process 1 ─────────────┐   ┌─ Process 2 ─────────────┐         │
+│   │ NNTP → Decode → Write   │   │ NNTP → Decode → Write   │  ...    │
+│   │  (AVX2 yEnc)            │   │  (AVX2 yEnc)            │         │
+│   └────────────┬────────────┘   └────────────┬────────────┘         │
+│                │  disjoint files, no cross-process byte transfer    │
+│                ▼                              ▼                      │
+│           Shared output dir  ──►  PAR2 verify + extract (main proc) │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
-### RAM Mode
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      RAM Mode Pipeline                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐                   │
-│  │  NNTP    │───>│  Decode  │───>│   RAM    │                   │
-│  │ Download │    │  (AVX2)  │    │  Buffer  │                   │
-│  │  (30+)   │    │   (24)   │    │ (BytesIO)│                   │
-│  └──────────┘    └──────────┘    └──────────┘                   │
-│                                        │                        │
-│                  ┌─────────────────────┘                        │
-│                  ▼                                              │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐                   │
-│  │  PAR2    │───>│ Extract  │───>│  Flush   │                   │
-│  │  Verify  │    │   (7z)   │    │ to Disk  │                   │
-│  │  (MD5)   │    │          │    │          │                   │
-│  └──────────┘    └──────────┘    └──────────┘                   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+Each process downloads a disjoint subset of files and writes its own complete
+outputs — there is **no cross-process transfer of segment bytes**, which is what
+makes the approach both correct and actually faster.
 
 ### Pipeline Components
 
-| Stage | Threads | Buffer | Technology |
+| Stage | Workers | Buffer | Technology |
 |-------|---------|--------|------------|
-| **Download** | 30-50 | 8 MB/conn | Async socket with SSL/TLS 1.3 |
-| **Decode** | CPU cores / 2 | Ring buffer | AVX2 SIMD (3+ GB/s) or Python fallback |
-| **Write** | 8-24 | 256 KB blocks | Direct I/O or RAM buffer |
-| **Verify** | 1 | Streaming | par2j64 / MD5 (RAM mode) |
+| **Download** | up to 100 conns (split across procs) | 8 MB/conn | Async socket, SSL/TLS 1.3 |
+| **Decode** | CPU cores / 2 per proc | Ring buffer | AVX2 SIMD (3+ GB/s) or Python fallback |
+| **Write** | 8-24 | 256 KB blocks | Direct I/O |
+| **Verify** | 1 (main proc) | Streaming | par2j64 |
 
 ### SSL/TLS Implementation
-
 ```python
 # Optimized for 10 Gbps throughput
 - TLS 1.3 preferred (faster handshake)
 - TLS 1.2 minimum (security)
 - AES-256-GCM cipher (hardware accelerated)
-- Session resumption enabled
+- Session resumption enabled (TLS tickets)
+- IPv4 + IPv6 (getaddrinfo, both families)
+- Throughput-adaptive pipeline depth (AIMD) + dynamic connection pool
 - Certificate verification (CERT_REQUIRED)
 ```
 
-Supports standard NNTPS ports: **563** (default), **443**
+Supports standard NNTPS ports: **563** (default), **443**.
 
-## Performance Benchmarks
+## Performance
 
-| Component | Throughput | Notes |
-|-----------|------------|-------|
-| **yEnc Decode (AVX2)** | 3.2 GB/s | 256-bit SIMD, 32-byte alignment |
-| **yEnc Decode (Python)** | 180 MB/s | NumPy-optimized fallback |
-| **NNTP Download** | Line speed | Tested up to 2.5 Gbps |
-| **Disk Write** | 800+ MB/s | NVMe with write-through disabled |
-| **PAR2 Verify (RAM)** | ~5 GB/s | Parallel MD5 checksums |
+Measured against a 6.7 GB test release on a 10 Gbps fiber line with a
+100-connection Newshosting account:
+
+| Configuration | Throughput | Notes |
+|---------------|------------|-------|
+| **Single process** | ~625 MB/s (~5 Gbps) | GIL-bound regardless of connections/pipeline depth |
+| **Multiprocess (2)** | ~956 MB/s | |
+| **Multiprocess (3)** | **~973 MB/s (~7.8 Gbps)** | Sweet spot |
+| **Multiprocess (4+)** | ~956 MB/s and down | Oversubscription hurts |
+| yEnc decode (AVX2) | 3.2 GB/s | 256-bit SIMD |
+| yEnc decode (Python) | ~180 MB/s | NumPy fallback |
+
+> The ceiling (~970 MB/s) is the provider/account aggregate
+> (100 conns × ~9.7 MB/s/conn). Going faster needs more connections (capped)
+> or a second provider.
 
 ## Download
 
-### Choose Your Edition
+Grab the latest standalone executable from [Releases](https://github.com/5ymph0en1x/DLER/releases):
 
-| | DLER Basic | DLER Ultimate |
-|---|:---:|:---:|
-| **Size** | ~38 MB | ~1 GB |
-| **RAM Mode** | ✅ | ✅ |
-| **yEnc Decoding** | ✅ 3+ GB/s (AVX2) | ✅ 3+ GB/s (AVX2) |
-| **PAR2 Verification** | ✅ CPU | ✅ CPU |
-| **PAR2 GPU Repair** | ❌ | ✅ CUDA |
-| **Requirements** | Any modern CPU | NVIDIA GPU + CUDA 13.x |
-
-**Which one should I download?**
-
-- **Basic** - You don't have an NVIDIA GPU, or want the smallest download
-- **Ultimate** - You have an NVIDIA GPU and want GPU-accelerated PAR2 repair
-
-> Both editions are functionally identical. The only difference is GPU acceleration for PAR2 repair.
-
-### From Release (Recommended)
-
-Download from [Releases](https://github.com/5ymph0en1x/DLER/releases):
-- `DLER_v1.2.1.exe` - Ultimate edition with CUDA support
-- `DLER_Basic_v1.2.1.exe` - Lightweight CPU-only edition
-
-No installation required - standalone executables.
+- **`DLER.exe`** — single onefile, no-console build (~47 MB). No installation, no
+  external dependencies — the extraction/repair tools are bundled inside.
 
 ## Installation
 
 ### Requirements
 
 - **OS:** Windows 10/11 (64-bit)
-- **CPU:** x86-64 with AVX2 (Intel Haswell 2013+ / AMD Excavator 2015+)
-- **RAM:** 2 GB minimum, 32+ GB recommended for RAM mode
-- **Python:** 3.11+ (3.14 recommended)
-- **GPU (Ultimate only):** NVIDIA GPU with CUDA 13.x for accelerated repair
+- **CPU:** x86-64 (AVX2 recommended for the 3+ GB/s decoder; a Python fallback runs without it)
+- **RAM:** 2 GB minimum
+- **Python (from source):** 3.11+ (3.14 recommended)
 
 ### From Source
 
@@ -168,73 +133,69 @@ No installation required - standalone executables.
 git clone https://github.com/5ymph0en1x/DLER.git
 cd DLER
 
-# Install dependencies
-pip install -r requirements.txt
+# Install dependencies (uv recommended)
+uv sync          # or: pip install -r requirements.txt
 
-# (Optional) Build AVX2 decoder for maximum performance
+# (Optional) Build the AVX2 decoder for maximum performance
 cd src/native
 python setup.py build_ext --inplace
 cd ../..
 
-# (Optional) Install CuPy for GPU acceleration
-pip install cupy-cuda13x --pre -U -f https://pip.cupy.dev/pre --no-binary cupy -v
-
 # Run
-python tk_main.py
+uv run python tk_main.py      # or: python tk_main.py
 ```
 
-### Building Native Extension
+The `tools/` directory (par2j64, 7z, UnRAR64) is included in the repo, so a
+fresh clone runs and builds with **nothing to download**.
 
-For maximum yEnc decoding performance (15x faster than Python):
+### Building the Native Extension
+
+For maximum yEnc decoding performance (much faster than the Python fallback):
 
 ```bash
 cd src/native
 python setup.py build_ext --inplace
 ```
 
-**Requirements:**
-- Visual Studio 2019+ with C++ Desktop workload
-- Windows SDK 10.0+
-- Python development headers
-
-The native extension uses AVX2 intrinsics for SIMD-parallel decoding:
+**Requirements:** Visual Studio 2019+ (C++ Desktop workload), Windows SDK 10.0+,
+Python development headers. The extension uses AVX2 intrinsics:
 
 ```cpp
 // Process 32 bytes per iteration
 __m256i chunk = _mm256_loadu_si256(input);
 __m256i decoded = _mm256_sub_epi8(chunk, offset_vec);
-// ... escape sequence handling with vectorized comparisons
+// ... escape-sequence handling with vectorized comparisons
 ```
 
-### Building Executables
-
-DLER uses a dual-build system to generate both Basic and Ultimate editions:
+### Building the Executable
 
 ```bash
-# Build Basic edition (~38 MB, CPU-only)
-python build_basic.py
-
-# Build Ultimate edition (~1 GB, GPU/CUDA)
-python build_ultimate.py
+# Single onefile, no-console build -> dist/DLER.exe
+uv run --with pyinstaller python build_basic.py
 ```
 
-The spec file (`dler_tk.spec`) automatically detects the `DLER_BUILD` environment variable:
-- `DLER_BUILD=basic` → Excludes CuPy/CUDA libraries
-- `DLER_BUILD=ultimate` → Includes full CUDA support
+The PyInstaller spec (`dler_tk.spec`) bundles the native yEnc decoder, the
+extraction/repair tools, the dark theme, and drag-and-drop support into one exe.
 
 ## Configuration
 
 ### First Launch
 
-1. Click **Settings** (gear icon)
+1. Open **Settings**.
 2. Configure your Usenet provider:
    - **Host:** news.yourprovider.com
    - **Port:** 563 (SSL) or 119 (plain)
    - **SSL:** Enabled (recommended)
-   - **Connections:** Start with 20, increase if stable
-3. Set download and extraction directories
-4. (Optional) Enable RAM mode for systems with 32+ GB RAM
-5. Save
+   - **Connections:** Set to your account's connection cap (e.g. 100).
+3. Set download and extraction directories.
+4. (Recommended for 10 Gbps) Enable **multiprocess** and set **`num_processes: 3`**.
+5. (Optional) In the **Automation** tab, enable the watch folder and/or a post-process command.
+6. Save.
+
+> **Performance gotcha:** leave `num_processes` at `0` and DLER auto-detects
+> `cpu_count` — on a 32-thread machine that means 32 processes fighting over the
+> connection cap (catastrophic oversubscription). **Always set `num_processes`
+> explicitly to 2 or 3.**
 
 ### Config File Location
 
@@ -242,106 +203,104 @@ The spec file (`dler_tk.spec`) automatically detects the `DLER_BUILD` environmen
 ~/.dler/config.json
 ```
 
+### Telegram Notification (optional)
+
+`dler_telegram.ps1` ships with placeholder credentials. To use it:
+
+1. Open `dler_telegram.ps1` and set `$Token` and `$ChatId` to your bot token and chat id.
+2. In **Settings → Automation → Post-process command**, set:
+   ```
+   powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\dler_telegram.ps1"
+   ```
+3. Preview without sending: `$env:DLER_TG_DRYRUN='1'; .\dler_telegram.ps1`
+
 ## Project Structure
 
 ```
 DLER/
-├── tk_main.py                  # Entry point
+├── tk_main.py                  # Entry point (with multiprocessing.freeze_support)
 ├── src/
 │   ├── core/
 │   │   ├── fast_nntp.py        # High-perf NNTP client (SSL, pipelining)
-│   │   ├── turbo_engine_v2.py  # Download orchestrator (thread pools)
-│   │   ├── turbo_yenc.py       # Python yEnc decoder (NumPy)
+│   │   ├── turbo_engine_v2.py  # Download orchestrator (thread pools, adaptive pipeline)
+│   │   ├── mp_engine.py        # Multiprocess engine (file sharding, GIL escape)
+│   │   ├── turbo_yenc.py       # Python yEnc decoder (NumPy fallback)
 │   │   ├── post_processor.py   # PAR2 + extraction + smart routing
-│   │   └── ram_processor.py    # RAM mode pipeline (v1.1.0)
+│   │   ├── ram_7z.py           # 7z.dll extraction backend (ctypes/COM)
+│   │   ├── ram_rar.py          # UnRAR64.dll extraction backend (ctypes)
+│   │   ├── adaptive_extractor.py # Release-type classification + extraction plan
+│   │   ├── watch_folder.py     # Watch-folder auto-ingest (polling + stability check)
+│   │   └── post_script.py      # Post-process command hook (DLER_* env vars)
 │   ├── gui/
 │   │   ├── tkinter_app.py      # Main GUI application
-│   │   └── speed_graph.py      # Real-time speed visualization
+│   │   ├── speed_graph.py      # Real-time speed visualization
+│   │   └── system_tray.py      # Optional system-tray integration
 │   ├── utils/
 │   │   └── config.py           # JSON config management
 │   └── native/
-│       ├── yenc_turbo.cpp      # AVX2 SIMD decoder
-│       └── setup.py            # Build script
-└── tools/
-    ├── 7z.exe                  # 7-Zip 23.01
-    ├── 7z.dll
-    └── par2j64.exe             # MultiPar 1.3.2.6
+│       ├── yenc_turbo.cpp      # AVX2 SIMD decoder source
+│       └── setup.py            # Native build script
+├── tools/                      # Bundled (committed) — nothing to download
+│   ├── 7z.exe / 7z.dll         # 7-Zip
+│   ├── par2j64.exe             # MultiPar (PAR2)
+│   └── UnRAR64.dll             # UnRAR (x64)
+├── dler_telegram.ps1           # Telegram completion-card hook (placeholders)
+├── build_basic.py              # Build entry point
+├── dler_tk.spec                # PyInstaller spec
+└── tests/                      # Test suite (uv run --with pytest pytest)
 ```
 
 ## Troubleshooting
 
 ### Slow Speeds
-1. Increase connections (Settings → Connections)
-2. Check your provider's connection limit
-3. Ensure SSL is enabled (some ISPs throttle plain NNTP)
-4. Try port 443 if 563 is blocked
+1. Enable multiprocess and set `num_processes` to 2 or 3 (do **not** leave it at 0).
+2. Set connections to your account's actual cap.
+3. Check your provider's connection limit (exceeding it makes the server reject connections).
+4. Ensure SSL is enabled (some ISPs throttle plain NNTP); try port 443 if 563 is blocked.
+
+### Download Freezes at Start (multiprocess)
+The main engine must hold **zero** connections in multiprocess mode so the child
+processes own the full account budget. DLER handles this automatically; if you
+see a stall, confirm `connections` does not exceed your account cap.
 
 ### PAR2 Repair Fails
-- Insufficient parity blocks in the release
-- Disk full (PAR2 needs temp space)
-- Antivirus blocking par2j64.exe
-
-### High Memory Usage
-- Disable RAM mode for systems with less than 16 GB RAM
-- Reduce connections (each uses ~8 MB buffer)
-- Reduce decoder threads in advanced settings
+- Insufficient parity blocks in the release.
+- Disk full (PAR2 needs temp space).
+- Antivirus blocking `par2j64.exe`.
 
 ### "AVX2 not available"
-Your CPU doesn't support AVX2. DLER will use the Python fallback decoder (still fast, ~180 MB/s).
-
-### "CuPy not available"
-GPU acceleration requires:
-- NVIDIA GPU with CUDA support
-- CUDA 13.x toolkit installed
-- CuPy package (`pip install cupy-cuda13x --pre -U -f https://pip.cupy.dev/pre --no-binary cupy -v`)
-
-DLER will fall back to CPU-based processing if CuPy is unavailable.
+Your CPU lacks AVX2. DLER falls back to the NumPy Python decoder (still ~180 MB/s).
 
 ## Bundled Tools
 
-| Tool | Version | License | Purpose |
-|------|---------|---------|---------|
-| 7-Zip | 23.01 | LGPL | Archive extraction |
-| par2j64 | 1.3.2.6 | GPL | PAR2 verification/repair |
+All tools are committed to the repo and bundled into the exe — users never need
+to download anything.
+
+| Tool | License | Purpose |
+|------|---------|---------|
+| 7-Zip (`7z.exe`/`7z.dll`) | LGPL | Archive extraction |
+| par2j64 (MultiPar) | GPL | PAR2 verification / repair |
+| UnRAR64 | freeware (RARLAB) | RAR extraction |
 
 ## Changelog
 
-### v1.2.1 (2026-01-17)
-- **New:** Matrix-style animated banner for README
-- **New:** Adaptive NNTP pipelining based on RTT measurement
-- **New:** Exponential backoff with jitter for connection retry
-- **Improved:** Connection health monitoring and dynamic pool management
+### v2.0.0 (2026-06-23)
+- **New:** Multiprocess download engine — escapes the GIL, ~970 MB/s (~7.8 Gbps) with 2-3 processes vs ~625 MB/s single-process.
+- **New:** Automation tab — watch folder (auto-ingest dropped `.nzb`, configurable 1-3600 s timer) and post-process command hook with rich `DLER_*` context.
+- **New:** Telegram completion-card hook (`dler_telegram.ps1`) — designed dark stat-card via Edge headless + curl.
+- **Fixed:** STOP now aborts every stage — multiprocess children, single-process engine, and in-flight PAR2/extraction.
+- **Removed:** RAM mode and GPU/CUDA (CuPy) processing, and the dual Basic/Ultimate editions — DLER is now a single, lean edition.
+- **Improved:** Connection-budget handling in multiprocess mode (main engine holds zero connections; children own the full cap).
 
-### v1.2.0 (2026-01-16)
-- **Fixed:** Multi-volume RAR extraction with encrypted headers now works correctly
-- **Fixed:** Password from NZB metadata properly used for all extraction stages
-- **Fixed:** Duplicate folder issue (Release.Name/Release.Name/) automatically corrected
-- **Improved:** Pre-sorted volume order for encrypted archives (uses NZB buffer index)
+### v1.3.0 (2026-06-23)
+- **New:** IPv4 + IPv6 dual-stack support (getaddrinfo, both families).
+- **New:** Throughput-adaptive pipeline depth (AIMD) + dynamic connection pool.
+- **New:** Session resumption enabled (TLS tickets).
 
-### v1.1.2 (2026-01-14)
-- **New:** Incremental PAR2 verification - verifies files as they complete downloading
-- **New:** Early damage detection - know if repair is needed before download finishes
-- **New:** Per-file MD5 verification with parallel computation
-- **Improved:** Post-processing pipeline optimization
-
-### v1.1.1 (2026-01-13)
-- **New:** Dual edition system (Basic ~38 MB / Ultimate ~1 GB)
-- **New:** CUDA kernel warmup for reduced first-use latency
-- **New:** VRAM memory management (automatic cleanup after GPU operations)
-- **Fixed:** Filename artifacts `(1/0)` no longer appear in downloaded files
-- **Fixed:** Multiple NZBs can now be downloaded in sequence without restart
-- **Fixed:** Automatic reconnection between downloads
-
-### v1.1.0 (2026-01-12)
-- **New:** RAM mode - full in-memory download and processing pipeline
-- **New:** GPU acceleration support (CuPy/CUDA)
-- **New:** Windows long path support (>260 characters)
-- **Fixed:** Archive detection in RAM mode
-- **Fixed:** File naming with obfuscated NZBs
-- **Fixed:** CuPy/NumPy compatibility with Python 3.14
-
-### v1.0.0
-- Initial release
+### v1.2.x and earlier
+- Multi-volume / encrypted RAR extraction fixes, incremental PAR2 verification,
+  adaptive NNTP pipelining, sequential multi-NZB downloads, and the initial
+  release. (See git history for full detail.)
 
 ## License
 
@@ -353,6 +312,7 @@ MIT License - See [LICENSE](LICENSE)
 - **yEnc specification:** Jeremy Nixon (2001)
 - **7-Zip:** Igor Pavlov
 - **MultiPar:** Yutaka Sawada
+- **UnRAR:** Alexander Roshal (RARLAB)
 
 ## Contributing
 

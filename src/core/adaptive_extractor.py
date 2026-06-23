@@ -32,7 +32,6 @@ from typing import Dict, List, Optional, Set, Tuple, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.core.nzb_parser import NZBFile, NZBDocument
-    from src.core.ram_processor import RamBuffer, RamFile
 
 logger = logging.getLogger(__name__)
 

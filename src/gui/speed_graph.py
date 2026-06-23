@@ -27,7 +27,7 @@ class SpeedGraphWidget(tk.Canvas):
     """
 
     # Colors matching DLER dark theme (park dark)
-    BG_COLOR = "#2b2b2b"          # Match interface background
+    BG_COLOR = "#313131"          # Match park-dark interface background
     GRID_COLOR = "#383838"        # Subtle grid lines
     LINE_COLOR = "#217346"        # Forest green
     LINE_GLOW = "#1a5c38"         # Darker green for glow

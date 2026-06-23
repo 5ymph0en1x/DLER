@@ -25,7 +25,7 @@
 // Pre-computed decode tables
 static uint8_t DECODE_TABLE[256];
 static uint8_t ESCAPE_TABLE[256];
-static uint32_t CRC32_TABLE[256];
+static uint32_t CRC32_TABLE[16][256];  // slice-by-16 (IEEE poly, reflected)
 static bool tables_initialized = false;
 
 // Runtime AVX2 detection
@@ -68,17 +68,63 @@ static void init_tables() {
         ESCAPE_TABLE[i] = (uint8_t)((i - 64 - 42) & 0xFF);
     }
 
-    // CRC32 table (IEEE polynomial 0xEDB88320)
+    // CRC32 slice-by-16 tables (IEEE polynomial 0xEDB88320, reflected).
+    // table[0] is the classic byte table; table[n] folds n+1 bytes ahead.
     for (uint32_t i = 0; i < 256; i++) {
         uint32_t crc = i;
         for (int j = 0; j < 8; j++) {
             crc = (crc & 1) ? ((crc >> 1) ^ 0xEDB88320) : (crc >> 1);
         }
-        CRC32_TABLE[i] = crc;
+        CRC32_TABLE[0][i] = crc;
+    }
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t crc = CRC32_TABLE[0][i];
+        for (int n = 1; n < 16; n++) {
+            crc = (crc >> 8) ^ CRC32_TABLE[0][crc & 0xFF];
+            CRC32_TABLE[n][i] = crc;
+        }
     }
 
     detect_avx2();
     tables_initialized = true;
+}
+
+// =============================================================================
+// Fast CRC32 (slice-by-16) — ~5-7 GB/s, well above a 10 Gbps (1.25 GB/s) link.
+// Produces the standard IEEE CRC32 (identical to zlib.crc32).
+// =============================================================================
+static uint32_t crc32_compute(const uint8_t* p, Py_ssize_t len) {
+    uint32_t crc = 0xFFFFFFFF;
+
+    while (len >= 16) {
+        uint32_t w0 = (uint32_t)p[0]  | ((uint32_t)p[1]  << 8) | ((uint32_t)p[2]  << 16) | ((uint32_t)p[3]  << 24);
+        uint32_t w1 = (uint32_t)p[4]  | ((uint32_t)p[5]  << 8) | ((uint32_t)p[6]  << 16) | ((uint32_t)p[7]  << 24);
+        uint32_t w2 = (uint32_t)p[8]  | ((uint32_t)p[9]  << 8) | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 24);
+        uint32_t w3 = (uint32_t)p[12] | ((uint32_t)p[13] << 8) | ((uint32_t)p[14] << 16) | ((uint32_t)p[15] << 24);
+        w0 ^= crc;
+        crc = CRC32_TABLE[15][ w0        & 0xFF] ^
+              CRC32_TABLE[14][(w0 >> 8)  & 0xFF] ^
+              CRC32_TABLE[13][(w0 >> 16) & 0xFF] ^
+              CRC32_TABLE[12][(w0 >> 24) & 0xFF] ^
+              CRC32_TABLE[11][ w1        & 0xFF] ^
+              CRC32_TABLE[10][(w1 >> 8)  & 0xFF] ^
+              CRC32_TABLE[ 9][(w1 >> 16) & 0xFF] ^
+              CRC32_TABLE[ 8][(w1 >> 24) & 0xFF] ^
+              CRC32_TABLE[ 7][ w2        & 0xFF] ^
+              CRC32_TABLE[ 6][(w2 >> 8)  & 0xFF] ^
+              CRC32_TABLE[ 5][(w2 >> 16) & 0xFF] ^
+              CRC32_TABLE[ 4][(w2 >> 24) & 0xFF] ^
+              CRC32_TABLE[ 3][ w3        & 0xFF] ^
+              CRC32_TABLE[ 2][(w3 >> 8)  & 0xFF] ^
+              CRC32_TABLE[ 1][(w3 >> 16) & 0xFF] ^
+              CRC32_TABLE[ 0][(w3 >> 24) & 0xFF];
+        p += 16;
+        len -= 16;
+    }
+    while (len-- > 0) {
+        crc = CRC32_TABLE[0][(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFF;
 }
 
 // =============================================================================
@@ -110,6 +156,19 @@ static Py_ssize_t decode_yenc_scalar(
     return out_len;
 }
 
+// Index of the first set bit. Caller guarantees x != 0.
+#ifdef _MSC_VER
+static inline unsigned int ctz32(unsigned int x) {
+    unsigned long idx;
+    _BitScanForward(&idx, x);
+    return (unsigned int)idx;
+}
+#else
+static inline unsigned int ctz32(unsigned int x) {
+    return (unsigned int)__builtin_ctz(x);
+}
+#endif
+
 // =============================================================================
 // AVX2 SIMD yEnc Decoder - 32 bytes per iteration
 // =============================================================================
@@ -127,7 +186,10 @@ static Py_ssize_t decode_yenc_avx2(
     const __m256i v_lf = _mm256_set1_epi8('\n');
     const __m256i v_eq = _mm256_set1_epi8('=');
 
-    // Process 32 bytes at a time when possible
+    // Process 32 bytes at a time. On a window containing special bytes, bulk-
+    // decode the clean prefix up to the FIRST special byte with one SIMD op,
+    // then handle just that byte — instead of crawling byte-by-byte through the
+    // clean data that precedes every line ending / escape.
     while (i + 32 <= src_len) {
         __m256i data = _mm256_loadu_si256((const __m256i*)(src + i));
 
@@ -136,29 +198,35 @@ static Py_ssize_t decode_yenc_avx2(
         __m256i is_lf = _mm256_cmpeq_epi8(data, v_lf);
         __m256i is_eq = _mm256_cmpeq_epi8(data, v_eq);
         __m256i is_special = _mm256_or_si256(_mm256_or_si256(is_cr, is_lf), is_eq);
+        unsigned int mask = (unsigned int)_mm256_movemask_epi8(is_special);
 
-        // Check if block is clean (no special chars)
-        if (_mm256_testz_si256(is_special, is_special)) {
-            // FAST PATH: No special characters - SIMD decode entire block
+        if (mask == 0) {
+            // FAST PATH: no special bytes - decode the whole 32-byte block.
             __m256i decoded = _mm256_sub_epi8(data, v_42);
             _mm256_storeu_si256((__m256i*)(output + out_len), decoded);
             out_len += 32;
             i += 32;
         } else {
-            // SLOW PATH: Has special chars - process one byte and continue
-            // This ensures we always make progress
+            // Bulk-decode the clean prefix [0, first) with one SIMD op. The
+            // 32-byte store is in-bounds (out_len + 32 <= i + 32 <= src_len);
+            // bytes past out_len+first are overwritten by later stores.
+            unsigned int first = ctz32(mask);
+            if (first > 0) {
+                __m256i decoded = _mm256_sub_epi8(data, v_42);
+                _mm256_storeu_si256((__m256i*)(output + out_len), decoded);
+                out_len += first;
+                i += first;
+            }
+            // i now points exactly at a special byte (= , \r or \n).
             uint8_t byte = src[i];
-
             if (byte == '=') {
                 i++;
                 if (i < src_len) {
                     output[out_len++] = ESCAPE_TABLE[src[i]];
                     i++;
                 }
-            } else if (byte == '\r' || byte == '\n') {
-                i++;
             } else {
-                output[out_len++] = DECODE_TABLE[byte];
+                // '\r' or '\n' - skip
                 i++;
             }
         }
@@ -198,12 +266,14 @@ static PyObject* py_decode(PyObject* self, PyObject* args) {
     const uint8_t* src = (const uint8_t*)input_buffer.buf;
     Py_ssize_t src_len = input_buffer.len;
 
-    // Allocate output buffer (max same size as input)
-    uint8_t* output = (uint8_t*)PyMem_Malloc(src_len);
-    if (!output) {
+    // Allocate the result bytes up front (decoded <= encoded) and decode IN PLACE
+    // into its buffer — no PyMem_Malloc, no extra copy. Resized down at the end.
+    PyObject* result = PyBytes_FromStringAndSize(NULL, src_len);
+    if (!result) {
         PyBuffer_Release(&input_buffer);
-        return PyErr_NoMemory();
+        return NULL;
     }
+    uint8_t* output = (uint8_t*)PyBytes_AS_STRING(result);
 
     Py_ssize_t out_len = 0;
 
@@ -219,11 +289,11 @@ static PyObject* py_decode(PyObject* self, PyObject* args) {
 
     Py_END_ALLOW_THREADS
 
-    PyObject* result = PyBytes_FromStringAndSize((char*)output, out_len);
-
-    PyMem_Free(output);
     PyBuffer_Release(&input_buffer);
 
+    if (_PyBytes_Resize(&result, out_len) != 0) {
+        return NULL;  // result already cleared by _PyBytes_Resize on failure
+    }
     return result;
 }
 
@@ -240,14 +310,16 @@ static PyObject* py_decode_with_crc(PyObject* self, PyObject* args) {
     const uint8_t* src = (const uint8_t*)input_buffer.buf;
     Py_ssize_t src_len = input_buffer.len;
 
-    uint8_t* output = (uint8_t*)PyMem_Malloc(src_len);
-    if (!output) {
+    // In-place decode into the result bytes (no malloc / no extra copy).
+    PyObject* bytes_result = PyBytes_FromStringAndSize(NULL, src_len);
+    if (!bytes_result) {
         PyBuffer_Release(&input_buffer);
-        return PyErr_NoMemory();
+        return NULL;
     }
+    uint8_t* output = (uint8_t*)PyBytes_AS_STRING(bytes_result);
 
     Py_ssize_t out_len = 0;
-    uint32_t crc = 0xFFFFFFFF;
+    uint32_t crc = 0;
 
     Py_BEGIN_ALLOW_THREADS
 
@@ -258,23 +330,80 @@ static PyObject* py_decode_with_crc(PyObject* self, PyObject* args) {
         out_len = decode_yenc_scalar(src, src_len, output);
     }
 
-    // Calculate CRC32 on decoded data
-    for (Py_ssize_t j = 0; j < out_len; j++) {
-        crc = CRC32_TABLE[(crc ^ output[j]) & 0xFF] ^ (crc >> 8);
-    }
-    crc ^= 0xFFFFFFFF;
+    // Fast slice-by-16 CRC32 over the decoded data (== zlib.crc32)
+    crc = crc32_compute(output, out_len);
 
     Py_END_ALLOW_THREADS
 
-    PyObject* bytes_result = PyBytes_FromStringAndSize((char*)output, out_len);
-    PyMem_Free(output);
     PyBuffer_Release(&input_buffer);
 
-    if (!bytes_result) return NULL;
+    if (_PyBytes_Resize(&bytes_result, out_len) != 0) {
+        return NULL;
+    }
 
-    PyObject* result = PyTuple_Pack(2, bytes_result, PyLong_FromUnsignedLong(crc));
+    PyObject* crc_obj = PyLong_FromUnsignedLong(crc);
+    if (!crc_obj) {
+        Py_DECREF(bytes_result);
+        return NULL;
+    }
+    PyObject* result = PyTuple_Pack(2, bytes_result, crc_obj);
     Py_DECREF(bytes_result);
+    Py_DECREF(crc_obj);
 
+    return result;
+}
+
+// =============================================================================
+// Python Interface: unstuff_body()
+// Copy buf[start:end] into a new bytes with NNTP dot-unstuffing applied
+// (a line beginning with '.' was sent doubled). Runs with the GIL RELEASED so
+// the per-body copy of every connection runs in parallel instead of serialising
+// on the GIL. Equivalent to Python:
+//     b = bytes(buf[start:end]); b = b.replace(b"\r\n..", b"\r\n.")
+//     if b[:2] == b"..": b = b[1:]
+// =============================================================================
+static PyObject* py_unstuff_body(PyObject* self, PyObject* args) {
+    Py_buffer in;
+    Py_ssize_t start, end;
+    if (!PyArg_ParseTuple(args, "y*nn", &in, &start, &end)) {
+        return NULL;
+    }
+    if (start < 0 || end < start || end > in.len) {
+        PyBuffer_Release(&in);
+        PyErr_SetString(PyExc_ValueError, "unstuff_body: invalid start/end");
+        return NULL;
+    }
+
+    const uint8_t* src = (const uint8_t*)in.buf + start;
+    Py_ssize_t n = end - start;
+
+    PyObject* result = PyBytes_FromStringAndSize(NULL, n);  // upper bound
+    if (!result) {
+        PyBuffer_Release(&in);
+        return NULL;
+    }
+    uint8_t* out = (uint8_t*)PyBytes_AS_STRING(result);
+    Py_ssize_t out_len = 0;
+
+    Py_BEGIN_ALLOW_THREADS
+    int at_line_start = 1;  // first body line is a line start
+    for (Py_ssize_t i = 0; i < n; i++) {
+        uint8_t c = src[i];
+        if (at_line_start && c == '.' && i + 1 < n && src[i + 1] == '.') {
+            // Stuffed dot: drop ONE '.', the next '.' is emitted as data.
+            at_line_start = 0;
+            continue;
+        }
+        out[out_len++] = c;
+        at_line_start = (c == '\n');
+    }
+    Py_END_ALLOW_THREADS
+
+    PyBuffer_Release(&in);
+
+    if (_PyBytes_Resize(&result, out_len) != 0) {
+        return NULL;
+    }
     return result;
 }
 
@@ -304,11 +433,13 @@ static PyObject* py_decode_batch(PyObject* self, PyObject* args) {
         const uint8_t* src = (const uint8_t*)PyBytes_AsString(item);
         Py_ssize_t src_len = PyBytes_Size(item);
 
-        uint8_t* output = (uint8_t*)PyMem_Malloc(src_len);
-        if (!output) {
+        // In-place decode into the per-item result bytes (no malloc / no copy).
+        PyObject* decoded = PyBytes_FromStringAndSize(NULL, src_len);
+        if (!decoded) {
             Py_DECREF(results);
-            return PyErr_NoMemory();
+            return NULL;
         }
+        uint8_t* output = (uint8_t*)PyBytes_AS_STRING(decoded);
 
         Py_ssize_t out_len = 0;
 
@@ -322,10 +453,7 @@ static PyObject* py_decode_batch(PyObject* self, PyObject* args) {
 
         Py_END_ALLOW_THREADS
 
-        PyObject* decoded = PyBytes_FromStringAndSize((char*)output, out_len);
-        PyMem_Free(output);
-
-        if (!decoded) {
+        if (_PyBytes_Resize(&decoded, out_len) != 0) {
             Py_DECREF(results);
             return NULL;
         }
@@ -351,6 +479,9 @@ static PyMethodDef YencTurboMethods[] = {
      "Decode yEnc data with AVX2 SIMD acceleration. Returns decoded bytes."},
     {"decode_with_crc", py_decode_with_crc, METH_VARARGS,
      "Decode yEnc data and compute CRC32. Returns (bytes, crc32)."},
+    {"unstuff_body", py_unstuff_body, METH_VARARGS,
+     "unstuff_body(buf, start, end) -> bytes: copy buf[start:end] with NNTP "
+     "dot-unstuffing, GIL released."},
     {"decode_batch", py_decode_batch, METH_VARARGS,
      "Decode multiple yEnc segments with AVX2 SIMD. Returns list of decoded bytes."},
     {"has_avx2", py_has_avx2, METH_NOARGS,
